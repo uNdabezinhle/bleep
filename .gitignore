@@ -1,0 +1,49 @@
+# extracts (local working copies of SDLC docs)
+_extract/
+
+# android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.ap_
+*.aab
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+relay/.test.db
+relay/.test.db-journal
+.test.db
+*.db
+
+# node
+node_modules/
+client/dist/
+client/coverage/
+npm-debug.log*
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.local
+*.pem
+
+# os
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ide
+.idea/
+.vscode/
+*.swp

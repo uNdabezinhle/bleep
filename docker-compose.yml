@@ -1,0 +1,81 @@
+# Public Bleep / Bleep-box image (T22): one command, sealed by default.
+# Relays store sealed envelopes with TTL. No search, no graph, no plaintext.
+#
+#   docker compose up --build
+#   open http://localhost:8090
+#
+# Two people on one machine: http://localhost:8090/?p=alice and /?p=bob
+
+name: bleep
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bleep}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bleep}
+      POSTGRES_DB: ${POSTGRES_DB:-bleep}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bleep}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  relay:
+    build: ./relay
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-bleep}:${POSTGRES_PASSWORD:-bleep}@postgres:5432/${POSTGRES_DB:-bleep}
+      BLEEP_REGION: ${BLEEP_REGION:-ZA-JHB}
+      BLEEP_TOKEN_SECRET: ${BLEEP_TOKEN_SECRET:-dev-only-change-me}
+      BLEEP_OPS_TOKEN: ${BLEEP_OPS_TOKEN:-dev-ops}
+      BLEEP_MAX_TTL_SECONDS: ${BLEEP_MAX_TTL_SECONDS:-129600}
+      BLEEP_ENV: box
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  web:
+    build: ./client
+    ports:
+      - "8090:80"
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:4.6.2
+    command:
+      - "--log-file=stdout"
+      - "--listening-port=3478"
+      - "--min-port=49160"
+      - "--max-port=49200"
+      - "--fingerprint"
+      - "--lt-cred-mech"
+      - "--user=${TURN_USER:-bleep}:${TURN_PASS:-bleep-dev}"
+      - "--realm=${TURN_REALM:-bleep.za}"
+      - "--no-tls"
+      - "--no-dtls"
+      - "--no-cli"
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
