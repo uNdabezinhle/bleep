@@ -10,12 +10,16 @@ class TokenOut(BaseModel):
     token: str
     mailbox_id: str
     region: str
+    short_id: str = ""
+    handle: str | None = None
 
 
 class AuthIn(BaseModel):
     mailbox_id: str
     nonce: str
     signature_b64: str
+    device_id: str | None = None
+    device_credential: str | None = None
 
 
 class PrekeyIn(BaseModel):

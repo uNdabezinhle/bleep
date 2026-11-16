@@ -13,9 +13,9 @@
   <h1>Hashes</h1>
   <p>T6: signed updates + a hash page. This invite build is not the Play APK. Do not call it audited or secure.</p>
   <p>Parents: BLEEP-TM-001 v0.1 · BLEEP-FC-001 v0.3 · protocol bind in <code>docs/PROTOCOL.md</code>.</p>
-  <p>Replace this page with SHA-256 of the Android APK and the relay image digest before a ZA closed ring.</p>
-  <pre><code>apk    (pending Android package)
-relay  (see docker image digest after compose build)
-client (this static tree)</code></pre>
+  <p>After <code>scripts/spin.ps1</code> this page lists the APK SHA-256 and a download at <code>/download/bleep.apk</code>.</p>
+  <pre><code>apk    pending — run scripts/spin.ps1
+relay  docker inspect after compose build
+client this static tree</code></pre>
 </body>
 </html>

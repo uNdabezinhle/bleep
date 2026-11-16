@@ -1,0 +1,33 @@
+{
+	# Clients that open the raw IP often send no SNI. Serve the IP certificate then.
+	default_sni 13.60.23.191
+	email bleep-test@13.60.23.191.sslip.io
+}
+
+bleep.de5.net, www.bleep.de5.net {
+	encode gzip
+	reverse_proxy web:80
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+}
+
+# The bare IP has no name the browser can check. Send it to the hostname.
+http://13.60.23.191 {
+	redir https://13.60.23.191.sslip.io{uri} 308
+}
+
+13.60.23.191.sslip.io {
+	encode gzip
+	reverse_proxy web:80
+}
+
+# Public cert for the IP, so https://13.60.23.191 is not a broken handshake.
+13.60.23.191 {
+	encode gzip
+	reverse_proxy web:80
+	tls {
+		issuer acme {
+			profile shortlived
+			disable_tlsalpn_challenge
+		}
+	}
+}

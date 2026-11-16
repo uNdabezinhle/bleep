@@ -54,6 +54,33 @@ object Bytes {
 }
 
 object Crypto {
+    fun freshRecoverySeed(): ByteArray = Bytes.random(16)
+
+    fun formatRecovery(seed: ByteArray): String = Bytes.hex(seed).chunked(4).joinToString("-")
+
+    fun parseRecovery(code: String): ByteArray {
+        val hex = code.lowercase().filter { it in '0'..'9' || it in 'a'..'f' }
+        require(hex.length == 32) { "Recovery code should be 16 bytes." }
+        return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    }
+
+    fun identityFromSeed(displayName: String, seed: ByteArray): Identity {
+        val edSk = kdf(seed, Bytes.utf8("bleep-ed"), "ed25519", 32)
+        val xSk = kdf(seed, Bytes.utf8("bleep-x"), "x25519", 32)
+        val ed = Ed25519PrivateKeyParameters(edSk)
+        val x = X25519PrivateKeyParameters(xSk)
+        return Identity(
+            mailboxId = Bytes.hex(kdf(seed, Bytes.utf8("bleep-box"), "mailbox", 16)),
+            edSk = ed.encoded,
+            edPk = ed.generatePublicKey().encoded,
+            xSk = x.encoded,
+            xPk = x.generatePublicKey().encoded,
+            displayName = displayName,
+        )
+    }
+
+    fun historyKey(seed: ByteArray): ByteArray = kdf(seed, Bytes.utf8("bleep-hist"), "bleep-history-v1", 32)
+
     fun generateIdentity(displayName: String): Identity {
         val ed = Ed25519PrivateKeyParameters(Bytes.random(32))
         val x = X25519PrivateKeyParameters(Bytes.random(32))
@@ -143,6 +170,29 @@ object Crypto {
 
     fun bleepCode(id: Identity): String =
         "BLEEP1:$REGION:${id.mailboxId}:${Bytes.b64e(id.edPk)}:${Bytes.b64e(id.xPk)}"
+
+    private const val SHORT_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+
+    fun shortIdFromInput(raw: String): String? {
+        val s = raw.trim().lowercase().replace(" ", "")
+        if (s.startsWith("bleep1") || s.startsWith("@")) return null
+        val compact = s.replace("-", "")
+        val shaped = s.length == 8 || Regex("^[a-z0-9]{4}-[a-z0-9]{4}$").matches(s)
+        if (!shaped || compact.length != 8 || compact.any { it !in SHORT_ALPHABET }) return null
+        return compact
+    }
+
+    fun formatShortId(id: String): String {
+        val compact = id.replace("-", "").lowercase()
+        return compact.take(4) + "-" + compact.drop(4).take(4)
+    }
+
+    fun handleFromInput(raw: String): String? {
+        val s = raw.trim()
+        if (s.uppercase().startsWith("BLEEP1") || shortIdFromInput(s) != null) return null
+        val h = (if (s.startsWith("@")) s.drop(1) else s).lowercase()
+        return if (Regex("^[a-z][a-z0-9_]{2,23}$").matches(h)) h else null
+    }
 
     fun parseCode(raw: String): Triple<String, ByteArray, ByteArray> {
         val p = raw.trim().split(":")

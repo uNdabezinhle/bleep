@@ -1,3 +1,4 @@
+import { expireMute } from "../chat/prefs";
 import { b64d, b64e, fromUtf8 } from "../protocol/bytes";
 import {
   authMessage,
@@ -45,18 +46,23 @@ export async function registerOnRelay(id: Identity, spk: SpkHold, opks: OpkHold[
     one_time_prekeys: opks.map((k) => ({ key_id: k.id, pub_b64: b64e(k.pk) })),
     registration_sig_b64: b64e(sign(id.edSk, registrationMessage(id.mailboxId, id.xPk))),
   };
-  return api.register(body) as Promise<{ token: string; mailbox_id: string; region: string }>;
+  return api.register(body) as Promise<{ token: string; mailbox_id: string; region: string; short_id?: string }>;
 }
 
-export async function login(id: Identity): Promise<string> {
+export async function login(
+  id: Identity,
+  device?: { id: string; credential: string },
+): Promise<{ token: string; shortId: string; handle: string }> {
   const ch = await api.challenge();
   const sig = b64e(sign(id.edSk, authMessage(id.mailboxId, ch.nonce)));
-  const tok = await api.token({
+  const tok = (await api.token({
     mailbox_id: id.mailboxId,
     nonce: ch.nonce,
     signature_b64: sig,
-  });
-  return tok.token as string;
+    device_id: device?.id,
+    device_credential: device?.credential,
+  })) as { token: string; short_id?: string; handle?: string | null };
+  return { token: tok.token, shortId: tok.short_id || "", handle: tok.handle || "" };
 }
 
 export function makePrekeys(n = 20): { spk: SpkHold; opks: OpkHold[] } {
@@ -128,12 +134,13 @@ export async function ensureAliceSession(
 }
 
 export type Payload =
-  | { kind: "text"; text: string; id: string; expireSec?: number | null; forwarded?: boolean; viewOnce?: boolean }
-  | { kind: "photo" | "voice" | "file"; text: string; id: string; mime: string; name: string; bytesB64: string; expireSec?: number | null; viewOnce?: boolean }
+  | { kind: "text"; text: string; id: string; expireSec?: number | null; forwarded?: boolean; viewOnce?: boolean; replyTo?: string; replyText?: string; groupId?: string; chamber?: boolean }
+  | { kind: "photo" | "voice" | "file"; text: string; id: string; mime: string; name: string; bytesB64: string; expireSec?: number | null; viewOnce?: boolean; replyTo?: string; replyText?: string; groupId?: string; chamber?: boolean }
   | {
       kind: "intro";
       text: string;
       displayName: string;
+      handle?: string;
       id: string;
       chamber?: boolean;
       burnAt?: number;
@@ -255,6 +262,7 @@ export function appendMsg(snap: VaultSnapshot, msg: Message): void {
   if (th) {
     th.lastAt = msg.at;
     th.lastPreview = msg.deleted ? "Deleted" : msg.kind === "voice" ? "Voice note" : msg.kind === "photo" ? "Photo" : msg.text.slice(0, 80);
+    expireMute(th);
     if (!msg.fromMe && !th.muted) th.unread += 1;
   }
 }

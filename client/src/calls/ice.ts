@@ -1,8 +1,8 @@
 /** In-region TURN only. Never stun.l.google.com (T19 / T23). Names never go here. */
 export function iceServers(): RTCIceServer[] {
   const host = location.hostname;
-  const user = "bleep";
-  const cred = "bleep-dev";
+  const user = import.meta.env.VITE_TURN_USER || "bleep";
+  const cred = import.meta.env.VITE_TURN_PASS || "bleep-dev";
   return [
     { urls: `stun:${host}:3478` },
     { urls: `turn:${host}:3478?transport=udp`, username: user, credential: cred },

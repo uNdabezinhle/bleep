@@ -32,6 +32,44 @@ export function generateIdentity(displayName: string, mailboxId = randomMailboxI
   return { mailboxId, edSk, edPk, xSk, xPk, displayName };
 }
 
+export function freshRecoverySeed(): Uint8Array {
+  return randomBytes(16);
+}
+
+export function formatRecovery(seed: Uint8Array): string {
+  return hexN(seed).match(/.{4}/g)!.join("-");
+}
+
+export function parseRecovery(code: string): Uint8Array {
+  const hex = code.trim().toLowerCase().replace(/[^a-f0-9]/g, "");
+  if (hex.length !== 32) throw new Error("Recovery code should be 16 bytes.");
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+export function identityFromSeed(displayName: string, seed: Uint8Array): Identity {
+  const edSk = kdf(seed, utf8("bleep-ed"), "ed25519", 32);
+  const xSk = kdf(seed, utf8("bleep-x"), "x25519", 32);
+  const mailboxId = hexN(kdf(seed, utf8("bleep-box"), "mailbox", 16));
+  return {
+    mailboxId,
+    edSk,
+    edPk: ed25519.getPublicKey(edSk),
+    xSk,
+    xPk: x25519.getPublicKey(xSk),
+    displayName,
+  };
+}
+
+export function historyKey(seed: Uint8Array): Uint8Array {
+  return kdf(seed, utf8("bleep-hist"), "bleep-history-v1", 32);
+}
+
+export function chamberKey(pin: string, chamberId: string): Uint8Array {
+  return kdf(utf8(pin), utf8(chamberId), "bleep-chamber-v1", 32);
+}
+
 export function sign(edSk: Uint8Array, msg: Uint8Array): Uint8Array {
   return ed25519.sign(msg, edSk);
 }
@@ -87,6 +125,47 @@ export function authMessage(mailboxId: string, nonce: string): Uint8Array {
 
 export function bleepCode(id: Identity): string {
   return `BLEEP1:${REGION}:${id.mailboxId}:${b64e(id.edPk)}:${b64e(id.xPk)}`;
+}
+
+/** Exact published handle, or null when the text is a Bleep ID or something else. */
+export function handleFromInput(raw: string): string | null {
+  const s = raw.trim();
+  if (s.toUpperCase().startsWith("BLEEP1")) return null;
+  if (shortIdFromInput(s)) return null;
+  const h = (s.startsWith("@") ? s.slice(1) : s).toLowerCase();
+  return /^[a-z][a-z0-9_]{2,23}$/.test(h) ? h : null;
+}
+
+const SHORT_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+
+/** Eight-character Bleep ID, or null. A hyphen is optional. */
+export function shortIdFromInput(raw: string): string | null {
+  const s = raw.trim().toLowerCase().replace(/\s+/g, "");
+  if (s.startsWith("bleep1") || s.startsWith("@")) return null;
+  const compact = s.replace(/-/g, "");
+  const shaped = s.length === 8 || /^[a-z0-9]{4}-[a-z0-9]{4}$/.test(s);
+  if (!shaped || compact.length !== 8 || [...compact].some((c) => !SHORT_ALPHABET.includes(c))) return null;
+  return compact;
+}
+
+export function formatShortId(id: string): string {
+  const compact = id.replace(/-/g, "").toLowerCase();
+  return `${compact.slice(0, 4)}-${compact.slice(4, 8)}`;
+}
+
+/** Published handle, without @. Null when the text is not a handle. */
+export function publishedHandle(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const h = raw.trim().replace(/^@/, "").toLowerCase();
+  return /^[a-z][a-z0-9_]{2,23}$/.test(h) ? h : null;
+}
+
+/** Chat title. A published handle wins. A short Bleep ID is not a name. */
+export function peerLabel(handle: string | null | undefined, displayName: string): string {
+  const h = publishedHandle(handle);
+  if (h) return `@${h}`;
+  if (!displayName || shortIdFromInput(displayName)) return "No handle";
+  return displayName;
 }
 
 export type ParsedCode = {

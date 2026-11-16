@@ -8,6 +8,18 @@ from .config import settings
 
 MAILBOX_RE = re.compile(r"^[a-z0-9]{16,64}$")
 HANDLE_RE = re.compile(r"^[a-z][a-z0-9_]{2,23}$")
+SHORT_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def new_short_id() -> str:
+    return "".join(secrets.choice(SHORT_ALPHABET) for _ in range(8))
+
+
+def normalize_short_id(raw: str) -> str | None:
+    s = raw.strip().lower().replace("-", "").replace(" ", "")
+    if len(s) == 8 and all(c in SHORT_ALPHABET for c in s):
+        return s
+    return None
 
 
 def utcnow() -> datetime:

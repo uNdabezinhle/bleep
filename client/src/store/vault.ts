@@ -1,4 +1,4 @@
-import { openDB, type IDBPDatabase } from "idb";
+import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { asAB, b64d, b64e, fromUtf8, utf8 } from "../protocol/bytes";
 import type { Identity } from "../protocol/keys";
 import type { VaultSnapshot } from "../types";
@@ -122,6 +122,33 @@ export class Vault {
     return this.key != null;
   }
 
+  async rewrap(pin: string, snapshot: VaultSnapshot): Promise<void> {
+    if (!this.key) throw new Error("locked");
+    if (pin.length < 4) throw new Error("PIN should be 4 characters or more.");
+    const old = this.key;
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await derive(pin, salt);
+    const ids = await this.db.getAllKeys("attachments");
+    const next: { id: IDBValidKey; iv: string; ct: string; mime: string }[] = [];
+    for (const id of ids) {
+      const row = await this.db.get("attachments", id);
+      if (!row) continue;
+      const pt = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: asAB(b64d(row.iv)) },
+        old,
+        asAB(b64d(row.ct)),
+      );
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: asAB(iv) }, key, asAB(new Uint8Array(pt)));
+      next.push({ id, iv: b64e(iv), ct: b64e(new Uint8Array(ct)), mime: row.mime });
+    }
+    const packed = await encryptJson(key, serialize(snapshot));
+    const wrap: Wrap = { salt: b64e(salt), iv: packed.iv, ct: packed.ct, iters: PBKDF2_ITERS, v: 1 };
+    for (const row of next) await this.db.put("attachments", { iv: row.iv, ct: row.ct, mime: row.mime }, row.id);
+    await this.db.put("meta", wrap, "wrap");
+    this.key = key;
+  }
+
   async save(snapshot: VaultSnapshot): Promise<void> {
     if (!this.key) throw new Error("locked");
     const wrap = (await this.db.get("meta", "wrap")) as Wrap;
@@ -181,8 +208,9 @@ export class Vault {
 
   async erase(): Promise<void> {
     this.key = null;
+    const name = dbName(this.profile);
     this.db.close();
-    await indexedDB.deleteDatabase(dbName(this.profile));
+    await deleteDB(name);
     await this.open();
   }
 }
@@ -205,7 +233,7 @@ export function emptySnapshot(identity: Identity): VaultSnapshot {
     messages: {},
     sessions: {},
     settings: {
-      autoLockSec: 60,
+      autoLockSec: 300,
       guardianMode: "warn",
       lowData: true,
       lockScreenPreview: false,

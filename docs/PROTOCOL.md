@@ -16,14 +16,79 @@ or “audited” until that review exists.
 | PQ hybrid | not in v1 | residual; add when a reviewed construction exists |
 | Group v1 | signed membership on clients; pairwise sealed fan-out | residual T7 group leak |
 | Store wrap | PIN → PBKDF2-SHA-256 → AES-256-GCM | Web Crypto |
+| Account password | Argon2id verifier | relay: `argon2-cffi` |
+| History blob | ChaCha20-Poly1305 under HKDF(recovery seed) | same AEAD as envelopes |
 | Relay bodies | none | relays never see inner plaintext |
 
 ## Identity
 
-A Bleep ID is a device-generated Ed25519 + X25519 pair. No phone, email, or
-OTP is required (T8). The mailbox routing ID is random and is not the identity
-key. Remote unlink marks the mailbox dead and the client registers a new
-routing ID (T13).
+A Bleep ID is an Ed25519 + X25519 pair made on the device. An account login is
+an email and a password. The password opens the account. It does not open
+messages. There is no phone number and no OTP.
+
+For an account, the mailbox id and both private keys come from a 16-byte
+recovery seed shown once on the device. The relay never receives that seed.
+
+- Ed25519 seed = HKDF-SHA-256(seed, salt=`bleep-ed`, info=`ed25519`, 32)
+- X25519 seed = HKDF-SHA-256(seed, salt=`bleep-x`, info=`x25519`, 32)
+- mailbox id = hex(HKDF-SHA-256(seed, salt=`bleep-box`, info=`mailbox`, 16))
+
+A device-only mailbox (no account) still uses a random mailbox id and random
+keys. The mailbox routing ID is not the identity public key. Remote unlink
+marks the mailbox dead and the client registers a new routing ID (T13).
+
+## Account, devices, history, directory
+
+The relay stores the normalized email, an Argon2id verifier, one mailbox id,
+and devices (id, label, SHA-256 credential hash, hour-band, revoked,
+erase_requested). It does not store a private key, the recovery code, or a
+plaintext vault.
+
+Mailbox tokens: a legacy box is `{mailbox}.{exp}.{mac}`. An account-linked box
+is `{mailbox}.{device}.{exp}.{mac}` and the token route requires a live device
+credential. Erase sets `erase_requested` and revokes that credential. The wipe
+runs the next time that device contacts the relay. A device that never comes
+back keeps its local files. An erased device cannot upload history.
+
+History is one sealed blob per account (ciphertext, 12-byte nonce, generation,
+size). The key is HKDF-SHA-256(seed, salt=`bleep-hist`, info=`bleep-history-v1`,
+32). There is no thread table and no sender column. Current blobs use
+`kind=shared-v1`. Shared fields are peers, threads, messages (text and
+attachment ids, not raw bytes), and requests. Each client keeps a pocket the
+other must round-trip unchanged: `web` holds that client's ratchet and
+settings, `android` holds the Android ratchet snapshot. Older `web` and
+`android` blobs still decrypt. Private keys, the recovery seed, and device
+credentials stay out of the blob.
+
+Attachment bytes are separate rows at `PUT/GET /v1/history/files/{id}`
+(nonce, ciphertext, size, mime, name), same history key, same size cap as an
+envelope. A Chamber is not in the main blob. While unlocked, the client uploads
+one sealed extra at `PUT /v1/history/extras/{id}`. That key is
+HKDF(PIN, salt=chamber id, info=`bleep-chamber-v1`), not the account recovery
+key. Opening Bleep does not open the Chamber.
+
+`POST /v1/accounts/devices/{id}/erase` marks that device. It does not unlink
+the mailbox. `POST /v1/accounts/close` checks the password, deletes the
+account, devices, reset and confirm tokens, history blob, file rows, and extra
+blobs, and marks the mailbox unlinked so the email can be reused. The password
+is not stored as a reason and is not logged.
+
+When SMTP is set, signup still creates the account and mails a single-use
+confirm link (hashed, 30 minutes). A device cannot be added until that link is
+opened. The link does not contain the recovery code. When SMTP is not set,
+signup still works and the response says the address was not confirmed because
+reset mail is not configured.
+
+`GET /v1/directory?q=` is a prefix of a published handle, at least 2 characters,
+authenticated with a mailbox token, 20 hits, rate-limited. Hits return the
+handle and identity public keys. They never return email. Queries are not
+stored. Exact `@handle` resolve stays. Search by email or display name is not
+a route.
+
+Password reset stores a single-use token hash for 30 minutes and replaces the
+verifier only. The mail does not contain the recovery code. A known email and
+an unknown email get the same sentence. Until SMTP is set, the response says
+reset mail is not configured.
 
 Bleep code (also the QR payload):
 
@@ -59,8 +124,12 @@ Wake-up (WebSocket) payload is `{"v":1,"wake":true}` only (T10).
 
 See `GET /v1/ops/holdings/{mailbox_id}` (ops token) and BLEEP-SDLC-008. Typical
 yield: mailbox created band, last connect hour-band, whether a handle was
-published, envelope count still inside TTL. Never plaintext, never a
-recipient×sender edge list, never Guardian hits, never a Chamber flag.
+published, envelope count still inside TTL, the account email when the mailbox
+is linked, the sealed history size, and counts of sealed file rows and extra
+blobs. Never plaintext, never the recovery code, never a recipient×sender edge
+list, never Guardian hits, never a Chamber flag. Reading history still takes
+the recovery code or a device that already has the key. Reading a Chamber extra
+takes the Chamber PIN.
 
 ## Region
 
@@ -69,7 +138,8 @@ returns `421` and the client fails closed (T21). Silent roam is a bug.
 
 ## Chamber and Guardian
 
-Chamber and Guardian are client modes, not relay features. A Chamber is a
-fresh keypair + mailbox + store + lock + burn deadline. Relays must not mark
-mailboxes as Chambers. Guardian runs on the composer buffer before `seal()`
-and on inbound plaintext after decrypt. It never phones home.
+Chamber and Guardian are client modes. A Chamber is a fresh keypair + mailbox
++ store + lock + burn deadline. The relay stores an extra ciphertext under an
+id the client chose and does not mark mailboxes as Chambers. Guardian runs on
+the composer buffer before `seal()` and on inbound plaintext after decrypt. It
+never phones home.

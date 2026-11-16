@@ -1,5 +1,17 @@
-import { asAB, b64d, b64e } from "./protocol/bytes";
-import { generateIdentity, type Identity } from "./protocol/keys";
+import { asAB, b64d, b64e, fromUtf8, utf8 } from "./protocol/bytes";
+import {
+  aeadDecrypt,
+  aeadEncrypt,
+  authMessage,
+  freshNonce,
+  generateIdentity,
+  chamberKey,
+  historyKey,
+  identityFromSeed,
+  parseRecovery,
+  sign,
+  type Identity,
+} from "./protocol/keys";
 import { api, wakeUrl, RegionMismatch } from "./net/api";
 import { inspectDraft, type Hit } from "./guardian/engine";
 import {
@@ -19,8 +31,9 @@ import {
   type SpkHold,
 } from "./session/session";
 import { emptySnapshot, Vault, profileName } from "./store/vault";
-import type { ChamberMeta, Message, Peer, Thread, VaultSnapshot } from "./types";
-import { parseBleepCode } from "./protocol/keys";
+import type { ChamberMeta, Message, Peer, StatusItem, Thread, VaultSnapshot } from "./types";
+import { cycleMute, nextDisappear } from "./chat/prefs";
+import { handleFromInput, peerLabel, publishedHandle, shortIdFromInput } from "./protocol/keys";
 import { iceServers } from "./calls/ice";
 
 
@@ -31,6 +44,49 @@ function holdsFromSnap(snap: VaultSnapshot): { spk: SpkHold; opks: OpkHold[] } {
     spk: { id: snap.prekeys.spk.id, sk: b64d(snap.prekeys.spk.sk), pk: b64d(snap.prekeys.spk.pk) },
     opks: snap.prekeys.opks.map((k) => ({ id: k.id, sk: b64d(k.sk), pk: b64d(k.pk) })),
   };
+}
+
+type LooseMsg = Message & { peerId?: string; bytesB64?: string; attachmentId?: string };
+
+type SharedHist = {
+  kind?: string;
+  displayName?: string;
+  peers?: Record<string, Partial<Peer> & { mailboxId?: string; edPk?: string; xPk?: string }>;
+  threads?: Record<string, Thread | LooseMsg[]>;
+  messages?: Record<string, LooseMsg[]>;
+  requests?: LooseMsg[];
+  blocked?: string[];
+  sessions?: VaultSnapshot["sessions"];
+  groups?: VaultSnapshot["groups"];
+  statuses?: VaultSnapshot["statuses"];
+  prekeys?: VaultSnapshot["prekeys"];
+  settings?: Partial<VaultSnapshot["settings"]>;
+  web?: {
+    sessions?: VaultSnapshot["sessions"];
+    prekeys?: VaultSnapshot["prekeys"];
+    settings?: Partial<VaultSnapshot["settings"]>;
+    groups?: VaultSnapshot["groups"];
+    statuses?: VaultSnapshot["statuses"];
+  };
+  android?: unknown;
+};
+
+function androidMessage(raw: LooseMsg, threadId: string): Message {
+  const fromMailbox = raw.fromMailbox || raw.peerId;
+  const msg: Message = {
+    ...raw,
+    threadId: raw.threadId || threadId,
+    fromMailbox,
+    kind: raw.kind || "text",
+    text: raw.text || "",
+    at: raw.at || Date.now(),
+    fromMe: Boolean(raw.fromMe),
+    id: raw.id,
+  };
+  if (raw.bytesB64 && !msg.attachmentId && /^[A-Za-z0-9_-]{8,80}$/.test(msg.id)) msg.attachmentId = msg.id;
+  delete (msg as { bytesB64?: string }).bytesB64;
+  delete (msg as { peerId?: string }).peerId;
+  return msg;
 }
 
 function storeHolds(spk: SpkHold, opks: OpkHold[]) {
@@ -62,6 +118,7 @@ export class Runtime {
   private localStream: MediaStream | null = null;
   private pendingOffer: RTCSessionDescriptionInit | null = null;
   private callTimer: number | null = null;
+  private labelsReady = false;
 
   async boot(): Promise<"setup" | "lock" | "app"> {
     await this.vault.open();
@@ -75,6 +132,7 @@ export class Runtime {
     const snap = emptySnapshot(id);
     snap.prekeys = storeHolds(spk, opks);
     const reg = await registerOnRelay(id, spk, opks);
+    if (reg.short_id) snap.settings.shortId = reg.short_id;
     this.token = reg.token;
     this.snap = snap;
     await this.vault.create(pin, snap);
@@ -88,8 +146,26 @@ export class Runtime {
   async unlock(pin: string): Promise<void> {
     this.snap = await this.vault.unlock(pin);
     this.locked = false;
-    this.token = await login(this.snap.identity);
+    try {
+      const session = await login(this.snap.identity, this.device());
+      this.token = session.token;
+      if (session.shortId) this.snap.settings.shortId = session.shortId;
+      this.snap.settings.handle = session.handle || undefined;
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      this.token = null;
+      this.vault.lock();
+      if (msg.includes("erase") || msg.includes("403")) {
+        await this.vault.erase();
+        this.snap = null;
+        this.locked = true;
+        throw new Error("This device was erased.");
+      }
+      this.snap = null;
+      throw e;
+    }
     this.regionOk = true;
+    await this.pullHistory();
     await this.poll();
     await this.flushOutbox();
     this.connectWake();
@@ -98,16 +174,135 @@ export class Runtime {
     this.bump();
   }
 
+  async signUp(email: string, password: string, displayName: string, pin: string, seed: Uint8Array): Promise<string> {
+    const id = identityFromSeed(displayName.trim() || "me", seed);
+    const account = (await api.createLogin(email, password)) as {
+      account_token: string;
+      email_confirmed: boolean;
+      detail: string;
+    };
+    if (!account.email_confirmed) return account.detail;
+    await this.enroll(id, account.account_token, email, seed, pin, true);
+    if (this.snap) {
+      this.snap.settings.emailConfirmed = true;
+      if (account.detail) this.snap.settings.confirmNote = account.detail;
+    }
+    return account.detail;
+  }
+
+  async signIn(email: string, password: string, recovery: string, pin: string): Promise<void> {
+    const seed = parseRecovery(recovery);
+    const account = (await api.loginAccount(email, password)) as { account_token: string; mailbox_id: string | null };
+    if (!account.mailbox_id) throw new Error("This account has no mailbox yet.");
+    const id = identityFromSeed("me", seed);
+    if (id.mailboxId !== account.mailbox_id) throw new Error("Recovery code does not match this account.");
+    await this.enroll(id, account.account_token, email, seed, pin, false);
+  }
+
+  private async enroll(
+    id: Identity,
+    accountToken: string,
+    email: string,
+    seed: Uint8Array,
+    pin: string,
+    fresh: boolean,
+  ): Promise<void> {
+    const { spk, opks } = makePrekeys(20);
+    const snap = emptySnapshot(id);
+    if (fresh) snap.prekeys = storeHolds(spk, opks);
+    if (fresh) {
+      const reg = await registerOnRelay(id, spk, opks);
+      if (reg.short_id) snap.settings.shortId = reg.short_id;
+    }
+    const ch = (await api.challenge()) as { nonce: string };
+    const sig = b64e(sign(id.edSk, authMessage(id.mailboxId, ch.nonce)));
+    const dev = (await api.addDevice(accountToken, {
+      label: "browser",
+      mailbox_id: id.mailboxId,
+      nonce: ch.nonce,
+      signature_b64: sig,
+    })) as { device_id: string; device_credential: string; token: string; short_id?: string; handle?: string | null };
+    if (dev.short_id) snap.settings.shortId = dev.short_id;
+    if (dev.handle) snap.settings.handle = dev.handle;
+    snap.settings.recoverySeed = b64e(seed);
+    snap.settings.deviceId = dev.device_id;
+    snap.settings.deviceCredential = dev.device_credential;
+    snap.settings.accountEmail = email.trim().toLowerCase();
+    snap.settings.historyGeneration = 0;
+    this.token = dev.token;
+    this.snap = snap;
+    this.locked = false;
+    this.regionOk = true;
+    if (!fresh) await this.pullHistory();
+    await this.vault.create(pin, this.snap);
+    this.connectWake();
+    this.armIdle();
+    this.bump();
+  }
+
+  private device(): { id: string; credential: string } | undefined {
+    const s = this.snap?.settings;
+    if (!s?.deviceId || !s.deviceCredential) return undefined;
+    return { id: s.deviceId, credential: s.deviceCredential };
+  }
+
+  async listDevices(): Promise<{ device_id: string; label: string; created_band: string; revoked: boolean; erase_requested: boolean; this_device: boolean }[]> {
+    if (!this.token) return [];
+    return (await api.devices(this.token)) as [];
+  }
+
+  async eraseRemote(deviceId: string): Promise<void> {
+    if (!this.token) return;
+    await api.eraseDeviceRemote(this.token, deviceId);
+  }
+
+  async revokeRemote(deviceId: string): Promise<void> {
+    if (!this.token) return;
+    await api.revokeDevice(this.token, deviceId);
+  }
+
+  async changeAccountPassword(current: string, next: string): Promise<void> {
+    const email = this.snap?.settings.accountEmail;
+    if (!email) throw new Error("This vault has no email login.");
+    const account = (await api.loginAccount(email, current)) as { account_token: string };
+    await api.changePassword(account.account_token, current, next);
+  }
+
+  async searchDirectory(q: string): Promise<{ handle: string; mailbox_id: string }[]> {
+    if (!this.token || q.trim().length < 2) return [];
+    const rows = (await api.directory(this.token, q.trim().toLowerCase())) as { handle: string; mailbox_id: string; identity_ed25519_b64: string; identity_x25519_b64: string }[];
+    const blocked = new Set(this.snap?.blocked ?? []);
+    return rows.filter((r) => !blocked.has(r.mailbox_id));
+  }
+
   lockNow(): void {
+    this.chamberPins.clear();
+    if (this.snap) {
+      for (const ch of Object.values(this.snap.chambers)) ch.unlocked = false;
+      for (const th of Object.values(this.snap.threads)) {
+        if (th.kind === "chamber") {
+          th.lockedStub = true;
+          th.lastPreview = "Chamber active · locked";
+        }
+      }
+    }
+    const snap = this.snap;
     this.teardownCall();
-    this.vault.lock();
-    this.snap = null;
     this.token = null;
     this.locked = true;
     this.ws?.close();
     this.ws = null;
+    if (this.wakeTimer) window.clearInterval(this.wakeTimer);
+    this.wakeTimer = 0;
     if (this.idleTimer) window.clearTimeout(this.idleTimer);
-    this.bump();
+    void this.pollChain.then(async () => {
+      if (snap && this.vault.unlocked) {
+        try { await this.vault.save(snap); } catch { /* already locked */ }
+      }
+      this.vault.lock();
+      this.snap = null;
+      this.onChange();
+    });
   }
 
   touch(): void {
@@ -117,7 +312,8 @@ export class Runtime {
 
   private armIdle(): void {
     if (this.idleTimer) window.clearTimeout(this.idleTimer);
-    const sec = this.snap?.settings.autoLockSec ?? 60;
+    const sec = this.snap?.settings.autoLockSec ?? 300;
+    if (!sec) return;
     this.idleTimer = window.setTimeout(() => this.lockNow(), sec * 1000);
   }
 
@@ -125,16 +321,451 @@ export class Runtime {
     if (this.snap && this.vault.unlocked) await this.vault.save(this.snap);
   };
 
+  private historyTimer = 0;
+  private pushingHistory = false;
+  private pollChain: Promise<void> = Promise.resolve();
+  private wakeTimer = 0;
+  private chamberPins = new Map<string, string>();
+  private extraGen = new Map<string, number>();
+  private uploadedFiles = new Set<string>();
+  private heldLocal = new Set<string>();
+
   bump(): void {
     this.onChange();
     void this.persist();
+    this.scheduleHistory();
+  }
+
+  private scheduleHistory(): void {
+    if (!this.snap?.settings.recoverySeed || !this.token || this.locked) return;
+    if (this.historyTimer) window.clearTimeout(this.historyTimer);
+    this.historyTimer = window.setTimeout(() => void this.pushHistory(), 1200);
+  }
+
+  private historyView() {
+    const s = this.snap!;
+    const {
+      recoverySeed: _seed,
+      deviceCredential: _cred,
+      deviceId: _id,
+      accountEmail: _email,
+      historyGeneration: _gen,
+      emailConfirmed: _confirmed,
+      confirmNote: _note,
+      ...rest
+    } = s.settings;
+    const threads: VaultSnapshot["threads"] = {};
+    for (const [id, thread] of Object.entries(s.threads)) {
+      if (id.startsWith("ch:") || thread.kind === "chamber") continue;
+      threads[id] = thread;
+    }
+    const messages: VaultSnapshot["messages"] = {};
+    for (const [id, msgs] of Object.entries(s.messages)) {
+      if (id.startsWith("ch:")) continue;
+      messages[id] = msgs.map((m) => {
+        const copy = { ...m };
+        delete (copy as { bytesB64?: string }).bytesB64;
+        return copy;
+      });
+    }
+    const body: Record<string, unknown> = {
+      kind: "shared-v1",
+      displayName: s.identity.displayName,
+      peers: s.peers,
+      threads,
+      messages,
+      requests: s.requests.filter((r) => !r.chamberInvite),
+      blocked: s.blocked,
+      web: {
+        sessions: s.sessions,
+        prekeys: s.prekeys,
+        settings: rest,
+        groups: s.groups,
+        statuses: s.statuses.map((st) => {
+          const copy = { ...st } as StatusItem & { bytesB64?: string };
+          delete copy.bytesB64;
+          return copy;
+        }),
+      },
+    };
+    if (s.androidPocketKnown) body.android = s.androidPocket ?? null;
+    return body;
+  }
+
+  private async pushHistory(): Promise<void> {
+    if (this.pushingHistory || !this.snap?.settings.recoverySeed || !this.token || this.locked) return;
+    this.pushingHistory = true;
+    try {
+      if (!this.snap.androidPocketKnown) await this.pullHistory();
+      if (!this.snap || this.locked) return;
+      const generation = (this.snap.settings.historyGeneration ?? 0) + 1;
+      const seed = b64d(this.snap.settings.recoverySeed);
+      const nonce = freshNonce();
+      const ct = aeadEncrypt(historyKey(seed), nonce, utf8(JSON.stringify(this.historyView())));
+      await api.putHistory(this.token, { generation, nonce_b64: b64e(nonce), blob_b64: b64e(ct) });
+      this.snap.settings.historyGeneration = generation;
+      await this.persist();
+      await this.syncFiles();
+      await this.pushChambers();
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      if (msg.includes("409")) await this.pullHistory();
+      if (msg.includes("erase")) {
+        await this.vault.erase();
+        this.lockNow();
+      }
+    } finally {
+      this.pushingHistory = false;
+    }
+  }
+
+  private async pullHistory(): Promise<void> {
+    if (!this.snap?.settings.recoverySeed || !this.token) return;
+    const remote = (await api.history(this.token)) as { generation: number; nonce_b64?: string; blob_b64?: string };
+    if (!remote.generation || !remote.blob_b64 || !remote.nonce_b64) {
+      this.snap.androidPocketKnown = true;
+      return;
+    }
+    const seed = b64d(this.snap.settings.recoverySeed);
+    const pt = aeadDecrypt(historyKey(seed), b64d(remote.nonce_b64), b64d(remote.blob_b64));
+    const data = JSON.parse(fromUtf8(pt)) as SharedHist;
+    const newer = remote.generation > (this.snap.settings.historyGeneration ?? 0);
+    if (data.kind === "shared-v1") {
+      this.snap.androidPocketKnown = true;
+      this.snap.androidPocket = data.android ?? null;
+      if (newer) this.applyShared(data, remote.generation);
+    } else if (data.kind === "android") {
+      this.snap.androidPocketKnown = true;
+      this.snap.androidPocket = data;
+      if (newer) this.applyAndroidBlob(data, remote.generation);
+    } else if (newer) {
+      this.applyWebBlob(data, remote.generation);
+    }
+    if (this.vault.unlocked) await this.persist();
+    if (newer) await this.hydrateFiles();
+  }
+
+  private applyShared(data: SharedHist, generation: number): void {
+    const s = this.snap!;
+    if (data.displayName) s.identity.displayName = data.displayName;
+    this.mergePeers(data.peers);
+    for (const [id, remote] of Object.entries(data.threads ?? {})) {
+      if (!remote || Array.isArray(remote) || id.startsWith("ch:") || remote.kind === "chamber") continue;
+      const local = s.threads[id];
+      if (!local || (remote.lastAt ?? 0) >= (local.lastAt ?? 0)) s.threads[id] = { ...local, ...remote };
+    }
+    this.mergeMessages(data.messages);
+    this.mergeRequests(data.requests);
+    s.blocked = [...new Set([...(data.blocked ?? []), ...s.blocked])];
+    const web = data.web;
+    if (web?.sessions) s.sessions = web.sessions;
+    if (web?.prekeys) s.prekeys = web.prekeys;
+    if (web?.groups) s.groups = { ...s.groups, ...web.groups };
+    if (web?.statuses) s.statuses = web.statuses;
+    this.keepSettings(web?.settings, generation);
+  }
+
+  private applyWebBlob(data: SharedHist, generation: number): void {
+    const s = this.snap!;
+    if (data.displayName) s.identity.displayName = data.displayName;
+    this.mergePeers(data.peers);
+    for (const [id, remote] of Object.entries(data.threads ?? {})) {
+      if (!remote || Array.isArray(remote) || id.startsWith("ch:") || remote.kind === "chamber") continue;
+      s.threads[id] = { ...remote, ...s.threads[id] };
+    }
+    this.mergeMessages(data.messages);
+    this.mergeRequests(data.requests);
+    s.blocked = [...new Set([...(data.blocked ?? []), ...s.blocked])];
+    if (data.sessions) s.sessions = { ...data.sessions, ...s.sessions };
+    if (data.groups) s.groups = { ...data.groups, ...s.groups };
+    if (data.prekeys) s.prekeys = data.prekeys;
+    this.keepSettings(data.settings, generation);
+  }
+
+  private applyAndroidBlob(data: SharedHist, generation: number): void {
+    const s = this.snap!;
+    if (data.displayName) s.identity.displayName = data.displayName;
+    this.mergePeers(data.peers);
+    const messages: Record<string, Message[]> = {};
+    for (const [key, value] of Object.entries(data.threads ?? {})) {
+      if (!Array.isArray(value)) continue;
+      const threadId = dmThreadId(s.identity.mailboxId, key);
+      messages[threadId] = value.map((m) => androidMessage(m, threadId));
+      if (!s.threads[threadId]) {
+        const peer = s.peers[key];
+        s.threads[threadId] = {
+          id: threadId,
+          kind: "dm",
+          peerMailboxId: key,
+          title: peer?.displayName || key.slice(0, 6),
+          lastPreview: "",
+          lastAt: Date.now(),
+          unread: 0,
+          pinned: false,
+          muted: false,
+          archived: false,
+          disappearingSec: null,
+          receipts: true,
+          typing: false,
+          draft: "",
+        };
+      }
+    }
+    this.mergeMessages(messages);
+    this.mergeMessages(data.messages);
+    this.mergeRequests(data.requests);
+    s.blocked = [...new Set([...(data.blocked ?? []), ...s.blocked])];
+    this.keepSettings(undefined, generation);
+  }
+
+  private mergePeers(peers: SharedHist["peers"]): void {
+    const s = this.snap!;
+    for (const [id, remote] of Object.entries(peers ?? {})) {
+      if (!remote?.mailboxId && !remote?.edPk) continue;
+      const local = s.peers[id];
+      const next: Peer = {
+        mailboxId: remote.mailboxId || id,
+        edPk: remote.edPk || local?.edPk || "",
+        xPk: remote.xPk || local?.xPk || "",
+        handle: publishedHandle(remote.handle) || local?.handle,
+        nickname: remote.nickname || local?.nickname,
+        displayName: peerLabel(
+          publishedHandle(remote.handle) || local?.handle,
+          remote.displayName || local?.displayName || "",
+        ),
+        verified: Boolean(local?.verified || remote.verified),
+        blocked: Boolean(local?.blocked || remote.blocked),
+        accepted: Boolean(local?.accepted || remote.accepted),
+        region: remote.region || local?.region || "ZA-JHB",
+        safetyChanged: local?.safetyChanged,
+        lastSafety: local?.lastSafety,
+        avatarId: "avatarId" in remote ? remote.avatarId || undefined : local?.avatarId,
+      };
+      s.peers[id] = next;
+    }
+  }
+
+  private mergeMessages(incoming: SharedHist["messages"]): void {
+    const s = this.snap!;
+    for (const [id, msgs] of Object.entries(incoming ?? {})) {
+      if (id.startsWith("ch:") || !Array.isArray(msgs)) continue;
+      const byId = new Map((s.messages[id] ?? []).map((m) => [m.id, m]));
+      for (const raw of msgs) {
+        const msg = androidMessage(raw, id);
+        const prev = byId.get(msg.id);
+        byId.set(msg.id, prev ? { ...prev, ...msg, attachmentId: msg.attachmentId || prev.attachmentId, needsDownload: prev.needsDownload } : msg);
+      }
+      s.messages[id] = [...byId.values()];
+    }
+  }
+
+  private mergeRequests(incoming: SharedHist["requests"]): void {
+    const s = this.snap!;
+    const byId = new Map(s.requests.map((r) => [r.id, r]));
+    for (const raw of incoming ?? []) {
+      if (!raw || raw.chamberInvite) continue;
+      const msg = androidMessage(raw, "requests");
+      if (!byId.has(msg.id)) byId.set(msg.id, msg);
+    }
+    s.requests = [...byId.values()];
+  }
+
+  private keepSettings(remote: Partial<VaultSnapshot["settings"]> | undefined, generation: number): void {
+    const s = this.snap!;
+    const keepSeed = s.settings.recoverySeed;
+    const keepDev = s.settings.deviceId;
+    const keepCred = s.settings.deviceCredential;
+    const keepEmail = s.settings.accountEmail;
+    const keepNote = s.settings.confirmNote;
+    const keepConfirmed = s.settings.emailConfirmed;
+    s.settings = {
+      ...s.settings,
+      ...remote,
+      recoverySeed: keepSeed,
+      deviceId: keepDev,
+      deviceCredential: keepCred,
+      accountEmail: keepEmail,
+      confirmNote: keepNote,
+      emailConfirmed: keepConfirmed,
+      historyGeneration: generation,
+    };
+  }
+
+  private deferBytes(): boolean {
+    return Boolean(this.snap?.settings.lowData && window.innerWidth < 840);
+  }
+
+  private async hydrateFiles(): Promise<void> {
+    if (!this.snap || !this.token) return;
+    const defer = this.deferBytes();
+    for (const msgs of Object.values(this.snap.messages)) {
+      for (const m of msgs) {
+        if (!m.attachmentId) continue;
+        const have = await this.vault.getAttachment(m.attachmentId).catch(() => null);
+        if (have) {
+          this.uploadedFiles.add(m.attachmentId);
+          continue;
+        }
+        if (defer) {
+          m.needsDownload = true;
+          continue;
+        }
+        try {
+          await this.fetchSealedFile(m);
+        } catch {
+          m.needsDownload = true;
+        }
+      }
+    }
+    for (const row of this.sealedFileRefs()) {
+      const have = await this.vault.getAttachment(row.id).catch(() => null);
+      if (have) {
+        this.uploadedFiles.add(row.id);
+        continue;
+      }
+      try {
+        await this.fetchAttachment(row.id, row.mime);
+      } catch {
+        /* photo can arrive with the next history pull */
+      }
+    }
+  }
+
+  private async fetchAttachment(id: string, fallbackMime = "application/octet-stream"): Promise<{ mime: string; name: string }> {
+    if (!this.snap?.settings.recoverySeed || !this.token) return { mime: fallbackMime, name: "file" };
+    const row = (await api.getHistoryFile(this.token, id)) as {
+      nonce_b64: string;
+      blob_b64: string;
+      mime: string;
+      name: string;
+    };
+    const seed = b64d(this.snap.settings.recoverySeed);
+    const bytes = aeadDecrypt(historyKey(seed), b64d(row.nonce_b64), b64d(row.blob_b64));
+    await this.vault.putAttachment(id, bytes, row.mime || fallbackMime);
+    this.uploadedFiles.add(id);
+    return { mime: row.mime || fallbackMime, name: row.name || "file" };
+  }
+
+  private async fetchSealedFile(msg: Message): Promise<void> {
+    if (!msg.attachmentId) return;
+    const row = await this.fetchAttachment(msg.attachmentId, msg.mime || "application/octet-stream");
+    msg.mime = msg.mime || row.mime;
+    msg.name = msg.name || row.name;
+    msg.needsDownload = false;
+  }
+
+  private sealedFileRefs(): { id: string; mime?: string; name?: string }[] {
+    if (!this.snap) return [];
+    const rows: { id: string; mime?: string; name?: string }[] = [];
+    const push = (id?: string, mime?: string, name?: string) => {
+      if (!id || rows.some((r) => r.id === id) || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) return;
+      rows.push({ id, mime, name });
+    };
+    push(this.snap.settings.avatarId, "image/jpeg", "profile.jpg");
+    for (const peer of Object.values(this.snap.peers)) push(peer.avatarId, "image/jpeg", "profile.jpg");
+    for (const st of this.snap.statuses) push(st.attachmentId, st.mime, st.name || "status");
+    return rows;
+  }
+
+  private async syncFiles(): Promise<void> {
+    if (!this.snap?.settings.recoverySeed || !this.token) return;
+    const seed = b64d(this.snap.settings.recoverySeed);
+    const key = historyKey(seed);
+    let pushed = false;
+    for (const [threadId, msgs] of Object.entries(this.snap.messages)) {
+      if (threadId.startsWith("ch:")) continue;
+      for (const m of msgs) {
+        if (!m.attachmentId || this.uploadedFiles.has(m.attachmentId)) continue;
+        if (!/^[A-Za-z0-9_-]{8,80}$/.test(m.attachmentId)) continue;
+        const att = await this.vault.getAttachment(m.attachmentId).catch(() => null);
+        if (!att) continue;
+        const nonce = freshNonce();
+        const ct = aeadEncrypt(key, nonce, att.bytes);
+        await api.putHistoryFile(this.token, m.attachmentId, {
+          nonce_b64: b64e(nonce),
+          blob_b64: b64e(ct),
+          mime: m.mime || att.mime,
+          name: m.name || "file",
+        });
+        this.uploadedFiles.add(m.attachmentId);
+        this.heldLocal.delete(m.attachmentId);
+        pushed = true;
+      }
+    }
+    for (const row of this.sealedFileRefs()) {
+      if (this.uploadedFiles.has(row.id)) continue;
+      const att = await this.vault.getAttachment(row.id).catch(() => null);
+      if (!att) continue;
+      const nonce = freshNonce();
+      const ct = aeadEncrypt(key, nonce, att.bytes);
+      await api.putHistoryFile(this.token, row.id, {
+        nonce_b64: b64e(nonce),
+        blob_b64: b64e(ct),
+        mime: row.mime || att.mime,
+        name: row.name || "file",
+      });
+      this.uploadedFiles.add(row.id);
+      pushed = true;
+    }
+    if (pushed) this.onChange();
+  }
+
+  pinHeld(chamberId: string): boolean {
+    return (this.chamberPins.get(chamberId)?.length ?? 0) >= 4;
+  }
+
+  filesWaitingLocally(): boolean {
+    return this.heldLocal.size > 0;
+  }
+
+  private async pushChambers(): Promise<void> {
+    if (!this.snap || !this.token) return;
+    for (const [id, pin] of this.chamberPins) {
+      if (pin.length < 4 || !this.snap.chambers[id]) continue;
+      const { relayToken: _token, ...meta } = this.snap.chambers[id];
+      void _token;
+      const payload = {
+        meta,
+        thread: this.snap.threads["ch:" + id],
+        messages: (this.snap.messages["ch:" + id] ?? []).map((m) => {
+          const copy = { ...m };
+          delete (copy as { bytesB64?: string }).bytesB64;
+          return copy;
+        }),
+      };
+      const nonce = freshNonce();
+      const ct = aeadEncrypt(chamberKey(pin, id), nonce, utf8(JSON.stringify(payload)));
+      const generation = (this.extraGen.get(id) ?? 0) + 1;
+      try {
+        const res = (await api.putHistoryExtra(this.token, id, {
+          generation,
+          nonce_b64: b64e(nonce),
+          blob_b64: b64e(ct),
+        })) as { generation: number };
+        this.extraGen.set(id, res.generation);
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        if (!msg.includes("409")) continue;
+        try {
+          const cur = (await api.getHistoryExtra(this.token, id)) as { generation: number };
+          this.extraGen.set(id, cur.generation);
+        } catch {
+          /* next unlock retries */
+        }
+      }
+    }
   }
 
   private connectWake(): void {
     if (!this.token) return;
     try {
       this.ws?.close();
+      if (this.wakeTimer) window.clearInterval(this.wakeTimer);
       const ws = new WebSocket(wakeUrl(this.token));
+      const poke = () => {
+        if (ws.readyState === WebSocket.OPEN) ws.send("1");
+      };
+      ws.onopen = () => poke();
       ws.onmessage = () => {
         void this.poll();
       };
@@ -144,16 +775,27 @@ export class Runtime {
         }, 4000);
       };
       this.ws = ws;
+      this.wakeTimer = window.setInterval(() => {
+        if (this.locked || this.ws !== ws) return;
+        poke();
+      }, 20000);
     } catch {
       /* wake is best-effort */
     }
   }
 
   async poll(): Promise<void> {
-    if (!this.token || !this.snap) return;
+    const run = this.pollChain.then(() => this.pollBody());
+    this.pollChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async pollBody(): Promise<void> {
+    if (!this.token || !this.snap || this.locked) return;
     try {
       const items = (await api.fetch(this.token)) as { id: string; blob_b64: string }[];
       for (const it of items) this.ingest(it.blob_b64);
+      await this.liftShortIds();
       await this.flushOutbox();
       this.sweepDisappearing();
       this.bump();
@@ -174,11 +816,15 @@ export class Runtime {
     const fromEd = b64e(inc.fromEd);
     const mailboxId = inc.mailboxId;
     const prev = this.snap.peers[mailboxId];
+    const incomingHandle = inc.payload.kind === "intro" ? publishedHandle(inc.payload.handle) : null;
+    const handle = incomingHandle || prev?.handle;
+    const named = displayOf(inc.payload);
     const peer: Peer = {
       mailboxId,
       edPk: fromEd,
       xPk: b64e(inc.fromX),
-      displayName: displayOf(inc.payload) || prev?.displayName || mailboxId.slice(0, 6),
+      handle,
+      displayName: peerLabel(handle, (named && !shortIdFromInput(named) ? named : prev?.displayName) || ""),
       verified: prev?.verified ?? false,
       blocked: this.snap.blocked.includes(mailboxId),
       accepted: prev?.accepted ?? false,
@@ -189,6 +835,7 @@ export class Runtime {
       peer.verified = false;
     }
     upsertPeer(this.snap, peer);
+    this.retitle(peer);
     if (peer.blocked) return;
 
     if (inc.payload.kind === "intro" && (!peer.accepted || inc.payload.chamber || inc.payload.groupId)) {
@@ -242,16 +889,54 @@ export class Runtime {
       return;
     }
 
+    if (inc.payload.kind === "ctrl" && inc.payload.op === "screen-capture") {
+      const th = ensureDmThread(this.snap, peer);
+      appendMsg(this.snap, {
+        id: inc.payload.id || crypto.randomUUID(),
+        threadId: th.id,
+        fromMe: false,
+        kind: "system",
+        text: "Their phone reported a screen capture. A photo of the screen is not attached, and a different app can stay silent.",
+        at: Date.now(),
+      });
+      this.bump();
+      return;
+    }
+
     if (inc.payload.kind === "ctrl" && inc.payload.op === "status") {
-      const data = (inc.payload.data as { text?: string; until?: number }) || {};
+      const data = (inc.payload.data as { text?: string; until?: number; mime?: string; name?: string; bytesB64?: string }) || {};
+      let attachmentId: string | undefined;
+      if (data.bytesB64) {
+        attachmentId = crypto.randomUUID();
+        void this.vault.putAttachment(attachmentId, b64d(data.bytesB64), data.mime || "application/octet-stream");
+      }
       this.snap.statuses.unshift({
         id: inc.payload.id,
         fromMailbox: mailboxId,
         fromName: peer.displayName,
         text: data.text,
+        attachmentId,
+        mime: data.mime,
+        name: data.name,
         at: Date.now(),
         until: data.until ?? Date.now() + 86_400_000,
       });
+      this.bump();
+      return;
+    }
+
+    if (inc.payload.kind === "ctrl" && inc.payload.op === "profile") {
+      const data = (inc.payload.data as { clear?: boolean; mime?: string; bytesB64?: string }) || {};
+      const stored = this.snap.peers[mailboxId];
+      if (!stored) return;
+      if (data.clear || !data.bytesB64) {
+        stored.avatarId = "";
+      } else {
+        const id = crypto.randomUUID();
+        void this.vault.putAttachment(id, b64d(data.bytesB64), data.mime || "image/jpeg");
+        stored.avatarId = id;
+      }
+      this.bump();
       return;
     }
 
@@ -306,40 +991,61 @@ export class Runtime {
         name: "name" in inc.payload ? inc.payload.name : undefined,
         mime: "mime" in inc.payload ? inc.payload.mime : undefined,
       };
-      if ("bytesB64" in inc.payload && inc.payload.bytesB64) {
+      const inboundFiles =
+        "bytesB64" in inc.payload && inc.payload.bytesB64
+          ? [{ name: msg.name || "file", mime: msg.mime || "", bytes: b64d(inc.payload.bytesB64) }]
+          : [];
+      if (inboundFiles.length) {
         const attId = crypto.randomUUID();
         const hold = !peer.accepted || this.snap.settings.lowData;
-        void this.vault.putAttachment(attId, b64d(inc.payload.bytesB64), inc.payload.mime);
+        const mime = "mime" in inc.payload ? inc.payload.mime : "";
+        void this.vault.putAttachment(attId, inboundFiles[0].bytes, mime);
         msg.attachmentId = attId;
         msg.needsDownload = hold;
-        const inboundHits = inspectDraft({
-          text: msg.text,
-          files: [
-            {
-              name: msg.name || "file",
-              mime: msg.mime || "",
-              bytes: b64d(inc.payload.bytesB64),
-            },
-          ],
-          peerVerified: peer.verified,
-          safetyJustChanged: false,
-          unknownSender: !peer.accepted,
-          inbound: true,
-        });
-        if (inboundHits.length && this.snap.settings.guardianMode !== "off") {
-          appendMsg(this.snap, {
-            id: crypto.randomUUID(),
-            threadId: th.id,
-            fromMe: false,
-            kind: "system",
-            text: "Guardian: " + inboundHits.map((h) => h.reason).join(" "),
-            at: Date.now(),
-          });
-        }
       }
+      const inboundHits = inspectDraft({
+        text: msg.text,
+        files: inboundFiles,
+        peerVerified: peer.verified,
+        safetyJustChanged: false,
+        unknownSender: !peer.accepted,
+        inbound: true,
+      });
       if ("viewOnce" in p && p.viewOnce) msg.viewOnce = true;
+      if ("replyTo" in p && p.replyTo) {
+        msg.replyTo = p.replyTo;
+        msg.replyText = p.replyText;
+      }
+      const inboundGroup = "groupId" in p && p.groupId ? p.groupId : "";
+      const inboundChamber = "chamber" in p && p.chamber === true;
+      if (inboundGroup && !this.snap.groups[inboundGroup]) {
+        this.snap.requests.push({ ...msg, threadId: "requests", groupId: inboundGroup, fromMailbox: mailboxId });
+        return;
+      }
+      if (inboundChamber) {
+        const chamberThread = Object.values(this.snap.threads).find((t) => t.kind === "chamber" && t.peerMailboxId === mailboxId);
+        if (!chamberThread) {
+          this.snap.requests.push({ ...msg, threadId: "requests", chamberInvite: true, fromMailbox: mailboxId });
+          return;
+        }
+        msg.threadId = chamberThread.id;
+      } else if (inboundGroup) {
+        msg.threadId = "g:" + inboundGroup;
+        msg.groupId = inboundGroup;
+      }
+      if (inboundHits.length && this.snap.settings.guardianMode !== "off") {
+        appendMsg(this.snap, {
+          id: crypto.randomUUID(),
+          threadId: msg.threadId,
+          fromMe: false,
+          kind: "system",
+          text: "Guardian: " + inboundHits.map((h) => h.reason).join(" "),
+          at: Date.now(),
+        });
+      }
       appendMsg(this.snap, msg);
-      if (th.receipts && !msg.fromMe && this.token) {
+      const home = this.snap.threads[msg.threadId];
+      if (home && home.kind !== "chamber" && home.receipts && !msg.fromMe && this.token) {
         void sendSealed(this.snap, this.token, peer, {
           kind: "receipt",
           id: crypto.randomUUID(),
@@ -352,31 +1058,68 @@ export class Runtime {
   async addByCode(code: string): Promise<Peer> {
     if (!this.snap || !this.token) throw new Error("locked");
     let peer: Peer;
-    if (code.startsWith("@")) {
-      const h = await api.resolveHandle(this.token, code.slice(1));
+    const short = shortIdFromInput(code);
+    const named = short ? null : handleFromInput(code);
+    if (short) {
+      let h: { mailbox_id: string; identity_ed25519_b64: string; identity_x25519_b64: string; short_id: string; handle?: string | null };
+      try {
+        h = (await api.resolveShort(this.token, short)) as typeof h;
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        const bare = code.trim().replace(/^@/, "").toLowerCase();
+        if (msg.includes("404") && !code.includes("-") && /^[a-z][a-z0-9_]{2,23}$/.test(bare)) {
+          return this.addByCode("@" + bare);
+        }
+        if (msg.includes("404")) throw new Error("No Bleep ID with that code.");
+        throw e;
+      }
+      const handle = publishedHandle(h.handle);
       peer = {
         mailboxId: h.mailbox_id,
         edPk: h.identity_ed25519_b64,
         xPk: h.identity_x25519_b64,
-        displayName: code,
+        handle: handle || undefined,
+        displayName: peerLabel(handle, ""),
+        verified: false,
+        blocked: false,
+        accepted: false,
+        region: "ZA-JHB",
+      };
+    } else if (named) {
+      let h: { mailbox_id: string; identity_ed25519_b64: string; identity_x25519_b64: string; handle: string };
+      try {
+        h = (await api.resolveHandle(this.token, named)) as typeof h;
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        if (msg.includes("404")) throw new Error("No published handle with that name.");
+        throw e;
+      }
+      const handle = publishedHandle(h.handle || named) || named;
+      peer = {
+        mailboxId: h.mailbox_id,
+        edPk: h.identity_ed25519_b64,
+        xPk: h.identity_x25519_b64,
+        handle,
+        displayName: peerLabel(handle, ""),
         verified: false,
         blocked: false,
         accepted: false,
         region: "ZA-JHB",
       };
     } else {
-      peer = peerFromCode(code);
       try {
-        const p = parseBleepCode(code);
-        if (p.region !== this.snap.settings.region) {
-          throw new Error(`Their code is pinned to ${p.region}. Yours is ${this.snap.settings.region}.`);
-        }
-      } catch (e) {
-        if ((e as Error).message.includes("pinned")) throw e;
         peer = peerFromCode(code);
+      } catch {
+        throw new Error("Paste a Bleep ID such as k7m2-pq9x, or a published handle.");
+      }
+      if (peer.region !== this.snap.settings.region) {
+        throw new Error(`Their code is pinned to ${peer.region}. Yours is ${this.snap.settings.region}.`);
       }
     }
+    if (peer.mailboxId === this.snap.identity.mailboxId) throw new Error("That is this account.");
+    if (this.snap.blocked.includes(peer.mailboxId)) throw new Error("That person is blocked.");
     upsertPeer(this.snap, peer);
+    this.retitle(peer);
     this.bump();
     return peer;
   }
@@ -388,7 +1131,11 @@ export class Runtime {
       id: crypto.randomUUID(),
       text: hello,
       displayName: this.snap.identity.displayName,
+      handle: publishedHandle(this.snap.settings.handle) || undefined,
     });
+    const stored = this.snap.peers[peer.mailboxId] ?? peer;
+    stored.accepted = true;
+    void this.shareProfileWith(stored).catch(() => undefined);
     this.bump();
   }
 
@@ -403,6 +1150,7 @@ export class Runtime {
     for (const r of reqs) {
       appendMsg(this.snap, { ...r, threadId: th.id });
     }
+    void this.shareProfileWith(peer).catch(() => undefined);
     this.bump();
   }
 
@@ -412,13 +1160,14 @@ export class Runtime {
     this.bump();
   }
 
-  previewHits(text: string, files: { name: string; mime: string; bytes: Uint8Array }[], peer?: Peer): Hit[] {
+  previewHits(text: string, files: { name: string; mime: string; bytes: Uint8Array }[], peers: Peer[] = []): Hit[] {
     if (!this.snap || this.snap.settings.guardianMode === "off") return [];
     return inspectDraft({
       text,
       files,
-      peerVerified: peer?.verified ?? false,
-      safetyJustChanged: Boolean(peer && !peer.verified),
+      peerVerified: peers.length === 0 || peers.every((p) => p.verified),
+      safetyJustChanged: peers.some((p) => p.safetyChanged),
+      several: peers.length > 1,
     });
   }
 
@@ -448,7 +1197,7 @@ export class Runtime {
     if (peers.some((p) => p.safetyChanged)) {
       throw new Error("Safety number changed. Verify it before you send — this is a new key, not a toast.");
     }
-    const hits = this.previewHits(text, files, peers[0]);
+    const hits = this.previewHits(text, files, peers);
     if (hits.length && this.snap.settings.guardianMode === "strict") return hits;
     if (hits.length && this.snap.settings.guardianMode === "warn") return hits;
     await this.commitSend(thread, text, files, false, viewOnce);
@@ -476,6 +1225,7 @@ export class Runtime {
       }
       const id = crypto.randomUUID();
       await this.vault.putAttachment(id, bytes, mime);
+      this.heldLocal.add(id);
       const kind = mime.startsWith("audio/") ? "voice" : mime.startsWith("image/") ? "photo" : "file";
       const msg: Message = {
         id,
@@ -490,6 +1240,9 @@ export class Runtime {
         status: "queued",
         expiresAt: thread.disappearingSec ? Date.now() + thread.disappearingSec * 1000 : undefined,
         viewOnce,
+        replyTo: thread.replyTo,
+        replyText: thread.replyText,
+        groupId: thread.kind === "group" ? thread.groupId : undefined,
       };
       appendMsg(this.snap, msg);
       await dropAll({
@@ -501,6 +1254,10 @@ export class Runtime {
         bytesB64: b64e(bytes),
         expireSec: thread.disappearingSec,
         viewOnce,
+        replyTo: thread.replyTo,
+        replyText: thread.replyText,
+        groupId: thread.kind === "group" ? thread.groupId : undefined,
+        chamber: thread.kind === "chamber" ? true : undefined,
       }, msg);
     }
     if (text.trim() && files.length === 0) {
@@ -515,6 +1272,9 @@ export class Runtime {
         status: "queued",
         expiresAt: thread.disappearingSec ? Date.now() + thread.disappearingSec * 1000 : undefined,
         viewOnce,
+        replyTo: thread.replyTo,
+        replyText: thread.replyText,
+        groupId: thread.kind === "group" ? thread.groupId : undefined,
       };
       appendMsg(this.snap, msg);
       await dropAll({
@@ -523,9 +1283,15 @@ export class Runtime {
         text,
         expireSec: thread.disappearingSec,
         viewOnce,
+        replyTo: thread.replyTo,
+        replyText: thread.replyText,
+        groupId: thread.kind === "group" ? thread.groupId : undefined,
+        chamber: thread.kind === "chamber" ? true : undefined,
       }, msg);
     }
     thread.draft = "";
+    thread.replyTo = undefined;
+    thread.replyText = undefined;
     this.bump();
   }
 
@@ -612,7 +1378,7 @@ export class Runtime {
     if (!this.snap || !this.token) throw new Error("locked");
     const id = generateIdentity("chamber");
     const { spk, opks } = makePrekeys(8);
-    await registerOnRelay(id, spk, opks);
+    const registered = await registerOnRelay(id, spk, opks);
     const meta: ChamberMeta = {
       id: id.mailboxId,
       title: `Chamber · ${peer.displayName}`,
@@ -622,6 +1388,7 @@ export class Runtime {
       createdAt: Date.now(),
       unlocked: true,
       unread: 0,
+      relayToken: registered.token,
     };
     this.snap.chambers[meta.id] = meta;
     this.snap.threads["ch:" + meta.id] = {
@@ -646,6 +1413,7 @@ export class Runtime {
       id: crypto.randomUUID(),
       text: `${this.snap.identity.displayName} wants a Chamber. Burn in ${days} days. Public Bleep cannot delete their screenshot.`,
       displayName: this.snap.identity.displayName,
+      handle: publishedHandle(this.snap.settings.handle) || undefined,
       chamber: true,
       burnAt: meta.burnAt,
       ephCode: `${id.mailboxId}`,
@@ -658,39 +1426,96 @@ export class Runtime {
     if (!this.snap || !this.token) return;
     const ch = this.snap.chambers[id];
     if (!ch) return;
-    void api.unlink(ch.mailboxId, this.token);
+    this.chamberPins.delete(id);
+    if (ch.relayToken && ch.mailboxId !== this.snap.identity.mailboxId) {
+      void api.unlink(ch.mailboxId, ch.relayToken);
+    }
     delete this.snap.chambers[id];
     delete this.snap.threads["ch:" + id];
     delete this.snap.messages["ch:" + id];
     this.bump();
   }
 
-  async publishStatus(text: string): Promise<void> {
+  async publishStatus(text: string, file?: { name: string; mime: string; bytes: Uint8Array }): Promise<void> {
     if (!this.snap || !this.token) return;
-    const item = {
+    const body = text.trim();
+    if (!body && !file) return;
+    if (file && file.bytes.byteLength > 3_000_000) throw new Error("Keep status files under 3 MB.");
+    let attachmentId: string | undefined;
+    if (file) {
+      attachmentId = crypto.randomUUID();
+      await this.vault.putAttachment(attachmentId, file.bytes, file.mime);
+    }
+    const item: StatusItem = {
       id: crypto.randomUUID(),
       fromMailbox: this.snap.identity.mailboxId,
       fromName: this.snap.identity.displayName,
-      text,
+      text: body || undefined,
+      attachmentId,
+      mime: file?.mime,
+      name: file?.name,
       at: Date.now(),
       until: Date.now() + 86400_000,
     };
     this.snap.statuses.unshift(item);
     const peers = Object.values(this.snap.peers).filter((p) => p.accepted && !p.blocked);
+    const data: { text?: string; until: number; mime?: string; name?: string; bytesB64?: string } = {
+      text: body || undefined,
+      until: item.until,
+    };
+    if (file) {
+      data.mime = file.mime;
+      data.name = file.name;
+      data.bytesB64 = b64e(file.bytes);
+    }
     for (const peer of peers) {
-      await sendSealed(
-        this.snap,
-        this.token,
-        peer,
-        { kind: "ctrl", id: item.id, op: "status", data: { text, until: item.until } },
-        { ttl: 86400 },
-      );
+      await sendSealed(this.snap, this.token, peer, { kind: "ctrl", id: item.id, op: "status", data }, { ttl: 86400 });
     }
     this.bump();
   }
 
-  async createGroup(name: string, memberIds: string[]): Promise<void> {
+  async setProfilePhoto(bytes: Uint8Array, mime: string): Promise<void> {
     if (!this.snap || !this.token) return;
+    if (bytes.byteLength > 1_500_000) throw new Error("Profile photo is too large.");
+    const id = crypto.randomUUID();
+    await this.vault.putAttachment(id, bytes, mime);
+    this.snap.settings.avatarId = id;
+    const peers = Object.values(this.snap.peers).filter((p) => p.accepted && !p.blocked);
+    for (const peer of peers) await this.shareProfileWith(peer);
+    this.bump();
+  }
+
+  async clearProfilePhoto(): Promise<void> {
+    if (!this.snap || !this.token) return;
+    this.snap.settings.avatarId = "";
+    const peers = Object.values(this.snap.peers).filter((p) => p.accepted && !p.blocked);
+    for (const peer of peers) {
+      await sendSealed(this.snap, this.token, peer, {
+        kind: "ctrl",
+        id: crypto.randomUUID(),
+        op: "profile",
+        data: { clear: true },
+      });
+    }
+    this.bump();
+  }
+
+  private async shareProfileWith(peer: Peer): Promise<void> {
+    if (!this.snap || !this.token || peer.blocked) return;
+    const id = this.snap.settings.avatarId;
+    if (!id) return;
+    const att = await this.vault.getAttachment(id).catch(() => null);
+    if (!att) return;
+    await sendSealed(this.snap, this.token, peer, {
+      kind: "ctrl",
+      id: crypto.randomUUID(),
+      op: "profile",
+      data: { mime: att.mime || "image/jpeg", bytesB64: b64e(att.bytes) },
+    });
+  }
+
+  async createGroup(name: string, memberIds: string[]): Promise<string> {
+    if (!this.snap || !this.token) throw new Error("locked");
     if (memberIds.length > 15) throw new Error("v1 groups stay small");
     const id = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
     const members = [
@@ -729,11 +1554,13 @@ export class Runtime {
         id: crypto.randomUUID(),
         text: `${this.snap.identity.displayName} invited you to “${name}”. Join is explicit — they cannot silent-add you.`,
         displayName: this.snap.identity.displayName,
+        handle: publishedHandle(this.snap.settings.handle) || undefined,
         groupId: id,
         groupName: name,
       });
     }
     this.bump();
+    return "g:" + id;
   }
 
   acceptGroup(fromMailbox: string, groupId: string, groupName: string): void {
@@ -762,13 +1589,37 @@ export class Runtime {
       draft: "",
       groupId,
     };
+    const held = this.snap.requests.filter((r) => r.groupId === groupId);
     this.snap.requests = this.snap.requests.filter((r) => r.groupId !== groupId);
+    for (const row of held) appendMsg(this.snap, { ...row, threadId: "g:" + groupId });
     this.bump();
   }
 
   async openHeld(msg: Message): Promise<void> {
+    if (msg.attachmentId) {
+      const have = await this.vault.getAttachment(msg.attachmentId).catch(() => null);
+      if (!have) await this.fetchSealedFile(msg);
+    }
     msg.needsDownload = false;
     this.bump();
+  }
+
+  async closeAccount(password: string): Promise<void> {
+    const email = this.snap?.settings.accountEmail;
+    if (!email) throw new Error("This vault has no email login.");
+    const account = (await api.loginAccount(email, password)) as { account_token: string };
+    await api.closeAccount(account.account_token, password);
+    await this.vault.erase();
+    this.lockNow();
+  }
+
+  async confirmEmail(token: string): Promise<void> {
+    await api.confirmAccount(token);
+    if (this.snap) {
+      this.snap.settings.emailConfirmed = true;
+      this.snap.settings.confirmNote = undefined;
+      this.bump();
+    }
   }
 
   async remoteUnlink(): Promise<void> {
@@ -779,8 +1630,10 @@ export class Runtime {
 
   async eraseDevice(): Promise<void> {
     if (this.snap && this.token) {
+      const deviceId = this.snap.settings.deviceId;
       try {
-        await api.unlink(this.snap.identity.mailboxId, this.token);
+        if (deviceId) await api.eraseDeviceRemote(this.token, deviceId);
+        else if (!this.snap.settings.accountEmail) await api.unlink(this.snap.identity.mailboxId, this.token);
       } catch {
         /* still wipe local */
       }
@@ -834,6 +1687,7 @@ export class Runtime {
 
   lockChamber(id: string): void {
     if (!this.snap) return;
+    this.chamberPins.delete(id);
     const ch = this.snap.chambers[id];
     const th = this.snap.threads["ch:" + id];
     if (ch) ch.unlocked = false;
@@ -844,13 +1698,33 @@ export class Runtime {
     this.bump();
   }
 
-  unlockChamber(id: string, pinOk: boolean): void {
-    if (!this.snap || !pinOk) return;
+  async unlockChamber(id: string, pin: string): Promise<boolean> {
+    if (!this.snap || pin.length < 4) return false;
+    if (this.token) {
+      try {
+        const row = (await api.getHistoryExtra(this.token, id)) as {
+          generation: number;
+          nonce_b64: string;
+          blob_b64: string;
+        };
+        const pt = aeadDecrypt(chamberKey(pin, id), b64d(row.nonce_b64), b64d(row.blob_b64));
+        const data = JSON.parse(fromUtf8(pt)) as { meta?: ChamberMeta; thread?: Thread; messages?: Message[] };
+        this.extraGen.set(id, row.generation);
+        if (data.meta) this.snap.chambers[id] = { ...data.meta, unlocked: true };
+        if (data.thread) this.snap.threads["ch:" + id] = { ...data.thread, lockedStub: false };
+        if (data.messages) this.snap.messages["ch:" + id] = data.messages;
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        if (!msg.includes("404")) return false;
+      }
+    }
+    this.chamberPins.set(id, pin);
     const ch = this.snap.chambers[id];
     const th = this.snap.threads["ch:" + id];
     if (ch) ch.unlocked = true;
     if (th) th.lockedStub = false;
     this.bump();
+    return true;
   }
 
   pinThread(thread: Thread): void {
@@ -859,7 +1733,19 @@ export class Runtime {
   }
 
   muteThread(thread: Thread): void {
-    thread.muted = !thread.muted;
+    cycleMute(thread);
+    this.bump();
+  }
+
+  cycleDisappear(thread: Thread): void {
+    thread.disappearingSec = nextDisappear(thread.disappearingSec);
+    this.bump();
+  }
+
+  setNickname(peer: Peer, raw: string): void {
+    const name = raw.trim();
+    peer.nickname = name || undefined;
+    this.retitle(peer);
     this.bump();
   }
 
@@ -875,12 +1761,22 @@ export class Runtime {
     this.bump();
   }
 
+  async unpublishHandle(): Promise<void> {
+    if (!this.snap || !this.token) return;
+    await api.dropHandle(this.token);
+    this.snap.settings.handle = undefined;
+    this.bump();
+  }
+
   async restoreFromExport(fileText: string, passphrase: string, pin: string): Promise<void> {
     const snap = await this.vault.importBlob(fileText, passphrase);
     this.snap = snap;
     await this.vault.create(pin, snap);
     this.locked = false;
-    this.token = await login(snap.identity);
+    const session = await login(snap.identity);
+    this.token = session.token;
+    if (session.shortId) snap.settings.shortId = session.shortId;
+    snap.settings.handle = session.handle || undefined;
     this.regionOk = true;
     await this.poll();
     this.connectWake();
@@ -1088,6 +1984,46 @@ export class Runtime {
       }
     }
     this.bump();
+  }
+
+  private retitle(peer: Peer): void {
+    if (!this.snap) return;
+    for (const th of Object.values(this.snap.threads)) {
+      if (th.peerMailboxId !== peer.mailboxId) continue;
+      if (th.kind === "dm") th.title = peer.nickname?.trim() || peer.displayName;
+      if (th.kind === "chamber") th.title = `Chamber · ${peer.displayName}`;
+    }
+  }
+
+  private async liftShortIds(): Promise<void> {
+    if (this.labelsReady || !this.snap || !this.token) return;
+    const pending = Object.values(this.snap.peers).filter((p) => !p.handle && shortIdFromInput(p.displayName));
+    this.labelsReady = true;
+    for (const peer of pending) {
+      const short = shortIdFromInput(peer.displayName);
+      if (!short) continue;
+      try {
+        const row = (await api.resolveShort(this.token, short)) as { handle?: string | null };
+        const handle = publishedHandle(row.handle);
+        if (handle) peer.handle = handle;
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        if (!msg.includes("404")) {
+          this.labelsReady = false;
+          continue;
+        }
+      }
+      peer.displayName = peerLabel(peer.handle, peer.displayName);
+      this.retitle(peer);
+    }
+    for (const peer of Object.values(this.snap.peers)) {
+      if (!peer.handle) continue;
+      const label = peerLabel(peer.handle, peer.displayName);
+      if (peer.displayName !== label) {
+        peer.displayName = label;
+        this.retitle(peer);
+      }
+    }
   }
 
   sweepDisappearing(): void {

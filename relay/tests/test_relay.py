@@ -53,6 +53,33 @@ def test_register_without_phone():
         acc = register(c)
         assert acc["mailbox_id"]
         assert acc["token"]
+        assert len(acc["short_id"]) == 8
+
+
+def test_short_id_resolves_with_or_without_hyphen():
+    with client() as c:
+        a = register(c)
+        b = register(c)
+        sid = a["short_id"]
+        headers = {**HDR, "Authorization": f"Bearer {b['token']}"}
+        shown = f"{sid[:4]}-{sid[4:]}"
+        hit = c.get(f"/v1/ids/{shown}", headers=headers)
+        assert hit.status_code == 200, hit.text
+        assert hit.json()["mailbox_id"] == a["mailbox_id"]
+        plain = c.get(f"/v1/ids/{sid}", headers=headers)
+        assert plain.status_code == 200
+        assert plain.json()["handle"] is None
+        pub = c.put(
+            "/v1/handles",
+            json={"handle": "leboone"},
+            headers={**HDR, "Authorization": f"Bearer {a['token']}"},
+        )
+        assert pub.status_code == 200, pub.text
+        named = c.get(f"/v1/ids/{sid}", headers=headers)
+        assert named.status_code == 200
+        assert named.json()["handle"] == "leboone"
+        missing = c.get("/v1/ids/bbbbbbbb", headers=headers)
+        assert missing.status_code in (404, 200)
 
 
 def test_envelope_has_no_sender_column():
@@ -121,7 +148,7 @@ def test_holdings_match_le_guide():
         )
         assert r.status_code == 200
         body = r.json()
-        assert body["transcript"] == "not held"
+        assert body["transcript"] == "not held as plaintext; a sealed history blob may exist for the account"
         assert body["who_they_talked_to"].startswith("not held")
         assert body["guardian_hits"] == "not held"
         assert body["phone_number"] == "not held"

@@ -19,19 +19,71 @@ export type GuardianInput = {
   safetyJustChanged: boolean;
   unknownSender?: boolean;
   inbound?: boolean;
+  several?: boolean;
 };
 
 export function inspectDraft(input: GuardianInput): Hit[] {
   const hits: Hit[] = [];
-  hits.push(...scanText(input.text, input.safetyJustChanged));
+  hits.push(...scanText(input.text, input.safetyJustChanged, input.peerVerified, input.several));
   for (const f of input.files) {
-    hits.push(...scanFile(f, input.inbound, input.unknownSender));
+    hits.push(...scanFile(f, input.inbound, input.unknownSender, !input.inbound));
   }
   return hits;
 }
 
-export function scanText(text: string, safetyJustChanged = false): Hit[] {
+function unverifiedNote(peerVerified: boolean, several = false): string {
+  if (peerVerified) return "";
+  return several
+    ? " A safety number in this chat is not marked verified."
+    : " Their safety number is not marked verified.";
+}
+
+export function scanText(text: string, safetyJustChanged = false, peerVerified = true, several = false): Hit[] {
   const hits: Hit[] = [];
+  const ask = unverifiedNote(peerVerified, several);
+  const lower = text.toLowerCase();
+  if (/e-?wallet|gift ?card|bitcoin|\bbtc\b|wallet address|mukuru|ozow|proof of payment|send (me )?money|wire transfer|airtime|payshap|snapscan|cash send|instant eft/.test(lower)) {
+    hits.push({
+      rule: "money",
+      reason: "This asks for money or a transfer." + ask,
+    });
+  }
+  if (/processing fee|verification fee|customs fee|recruitment fee|claim your prize|guaranteed return|double your money/.test(lower)) {
+    hits.push({
+      rule: "fee",
+      reason: "This asks for a fee, a prize, or a return." + ask,
+    });
+  }
+  if (/send (me )?(a |some )?(nudes|nude pics|naked photos?)|verification video/.test(lower)) {
+    hits.push({
+      rule: "private",
+      reason: "This asks for a private image or video." + ask,
+    });
+  }
+  if (/recovery code|seed phrase|your password|account password/.test(lower)) {
+    hits.push({
+      rule: "secret",
+      reason: "This asks for a password or the recovery code." + ask,
+    });
+  }
+  if (/anydesk|teamviewer|rustdesk|remote access|\.apk\b/.test(lower)) {
+    hits.push({
+      rule: "remote",
+      reason: "This asks for a remote-control app or an APK." + ask,
+    });
+  }
+  if (/whatsapp|telegram|signal me|continue (this|the chat) on|email me at/.test(lower)) {
+    hits.push({
+      rule: "move",
+      reason: "This asks to continue off Bleep." + ask,
+    });
+  }
+  if (/https?:\/\/\S+|www\.\S+/.test(lower) && (/login|verify your account|password reset|ozow|\bfnb\b|capitec|absa|standard\s*bank|paypal/.test(lower) || /https?:\/\/\d{1,3}(?:\.\d{1,3}){3}/.test(lower))) {
+    hits.push({
+      rule: "link",
+      reason: "This looks like a login or bank link. Guardian did not open it." + ask,
+    });
+  }
   const digits = text.replace(/\D/g, "");
   // SA ID: warn only on a passing checksum (TV-L1-03 failing checksum stays quiet)
   for (const m of text.match(/\b\d{13}\b/g) ?? []) {
@@ -121,9 +173,20 @@ export function scanFile(
   file: { name: string; mime: string; bytes: Uint8Array },
   inbound = false,
   unknownSender = false,
+  standing = true,
 ): Hit[] {
   const hits: Hit[] = [];
   const name = file.name.toLowerCase();
+  const magic = sniffMime(file.bytes);
+  const claimed = (file.mime || "").toLowerCase();
+  const image = claimed.startsWith("image/") || Boolean(magic?.startsWith("image/"));
+  const video = claimed.startsWith("video/") || /\.(mp4|mov|webm|mkv)$/.test(name);
+  if (standing && (image || video)) {
+    hits.push({
+      rule: "frame",
+      reason: "This check does not read the picture or the frames. A frame can show an ID, a banking screen, or a face.",
+    });
+  }
   if (/\.(apk|xapk|html?|xhtml|vcf|ics)$/.test(name) || /whatsapp chat|chat\.txt|export/.test(name)) {
     hits.push({
       rule: "filename",
@@ -140,8 +203,6 @@ export function scanFile(
       strip: "file",
     });
   }
-  const magic = sniffMime(file.bytes);
-  const claimed = (file.mime || "").toLowerCase();
   if (claimed.startsWith("image/") && magic && !magic.startsWith("image/")) {
     hits.push({
       rule: "mime",

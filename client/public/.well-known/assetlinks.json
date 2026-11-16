@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "za.bleep.personal",
+      "sha256_cert_fingerprints": [
+        "F6:0B:2D:E2:AB:2D:D6:93:42:C5:F8:FA:B6:17:22:83:9D:09:A1:7D:54:4E:8B:D2:EF:BD:E6:46:C2:83:21:99"
+      ]
+    }
+  }
+]

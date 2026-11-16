@@ -29,6 +29,46 @@ describe("OTP shape", () => {
   });
 });
 
+describe("chat patterns", () => {
+  it("warns on a money ask and names an unverified safety number", () => {
+    const hits = scanText("please send money to my ewallet", false, false);
+    expect(hits.some((h) => h.rule === "money")).toBe(true);
+    expect(hits.some((h) => h.reason.includes("not marked verified"))).toBe(true);
+    expect(hits.some((h) => /scam/i.test(h.reason))).toBe(false);
+  });
+  it("warns when the chat is asked to move off Bleep", () => {
+    expect(scanText("continue this chat on whatsapp").some((h) => h.rule === "move")).toBe(true);
+  });
+  it("warns on a bank-shaped link and stays quiet on a bare url", () => {
+    expect(scanText("open https://fnb.example/login").some((h) => h.rule === "link")).toBe(true);
+    expect(scanText("https://example.com/photo").some((h) => h.rule === "link")).toBe(false);
+  });
+  it("warns on a fee, a prize, a private image, and a local payment rail", () => {
+    expect(scanText("pay the processing fee").some((h) => h.rule === "fee")).toBe(true);
+    expect(scanText("claim your prize").some((h) => h.rule === "fee" && !/scam/i.test(h.reason))).toBe(true);
+    expect(scanText("send me nudes").some((h) => h.rule === "private")).toBe(true);
+    expect(scanText("use snapscan").some((h) => h.rule === "money")).toBe(true);
+  });
+  it("names an unverified safety number once for a group", () => {
+    const hits = scanText("please send money", false, false, true);
+    expect(hits.some((h) => h.reason.includes("in this chat"))).toBe(true);
+    expect(hits.some((h) => h.reason.includes("Their safety number"))).toBe(false);
+  });
+  it("stays quiet on ordinary chat", () => {
+    expect(scanText("see you at 5")).toEqual([]);
+    expect(scanText("my bank is closed today")).toEqual([]);
+    expect(scanText("send me the picnic photo")).toEqual([]);
+  });
+  it("adds the unread-pixels line for an image", () => {
+    const hits = scanFile({
+      name: "shot.jpg",
+      mime: "image/jpeg",
+      bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+    });
+    expect(hits.some((h) => h.rule === "frame")).toBe(true);
+  });
+});
+
 describe("MIME / EXIF", () => {
   it("sniffs jpeg vs zip", () => {
     expect(sniffMime(new Uint8Array([0xff, 0xd8, 0xff, 0xe0]))).toBe("image/jpeg");

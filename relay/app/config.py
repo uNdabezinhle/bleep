@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     bleep_handle_min_len: int = 3
     bleep_handle_max_len: int = 24
     bleep_env: str = "dev"
+    bleep_public_origin: str = "https://bleep.de5.net"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_pass: str = ""
+    smtp_from: str = ""
 
 
 settings = Settings()

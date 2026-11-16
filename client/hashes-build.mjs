@@ -18,10 +18,11 @@ const html = `<!doctype html>
   <h1>Hashes</h1>
   <p>T6: signed updates + a hash page. This invite build is not the Play APK. Do not call it audited or secure.</p>
   <p>Parents: BLEEP-TM-001 v0.1 · BLEEP-FC-001 v0.3</p>
+  <p>After <code>scripts/spin.ps1</code>, this page is replaced with the APK SHA-256 and a download link at <code>/download/bleep.apk</code>.</p>
   <pre><code>client js  sha256:${h}
 file       ${f}
 relay      docker inspect --format="{{.Id}}" bleep-relay
-apk        pending Android package</code></pre>
+apk        pending — run scripts/spin.ps1</code></pre>
 </body>
 </html>
 `;

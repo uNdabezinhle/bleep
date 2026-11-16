@@ -10,6 +10,9 @@ android/local.properties
 *.ap_
 *.aab
 
+# spin overlay (APK + generated hashes served by nginx)
+dist-download/
+
 # python
 __pycache__/
 *.py[cod]

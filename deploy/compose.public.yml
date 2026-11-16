@@ -1,0 +1,26 @@
+# Public box in front of docker-compose.yml.
+# TLS on 443, HTTP on 80 (Let's Encrypt). Coturn uses the host network in the base file.
+# Run from the repo root:
+#   docker compose -f docker-compose.yml -f deploy/compose.public.yml up --build -d
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      BLEEP_DOMAIN: ${BLEEP_DOMAIN:?set BLEEP_DOMAIN in .env}
+      BLEEP_ACME_EMAIL: ${BLEEP_ACME_EMAIL:?set BLEEP_ACME_EMAIL in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/certs:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+volumes:
+  caddy_data:
+  caddy_config:

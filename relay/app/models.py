@@ -20,9 +20,96 @@ class Mailbox(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_connect_band: Mapped[str | None] = mapped_column(String(16), nullable=True)
     handle: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True)
+    short_id: Mapped[str | None] = mapped_column(String(8), unique=True, nullable=True)
     unlink_dead: Mapped[bool] = mapped_column(Boolean, default=False)
     region: Mapped[str] = mapped_column(String(16), default="ZA-JHB")
     bytes_in_flight: Mapped[int] = mapped_column(Integer, default=0)
+    account_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+
+
+class Account(Base):
+    """Login record. Identity private keys never live here."""
+
+    __tablename__ = "accounts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    email_confirmed: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Device(Base):
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), index=True)
+    label: Mapped[str] = mapped_column(String(64), default="device")
+    credential_hash: Mapped[str] = mapped_column(String(64))
+    created_band: Mapped[str] = mapped_column(String(16))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    erase_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class HistoryBlob(Base):
+    """Sealed account history. Ciphertext only. No thread table."""
+
+    __tablename__ = "history_blobs"
+
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    blob: Mapped[bytes] = mapped_column(LargeBinary)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class HistoryFile(Base):
+    """Sealed attachment. Ciphertext only. Not a thread row."""
+
+    __tablename__ = "history_files"
+
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), primary_key=True)
+    file_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    blob: Mapped[bytes] = mapped_column(LargeBinary)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    mime: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    name: Mapped[str] = mapped_column(String(200), default="file")
+
+
+class HistoryExtra(Base):
+    """Sealed side blob, keyed by an id the client chose. Ciphertext only."""
+
+    __tablename__ = "history_extras"
+
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), primary_key=True)
+    extra_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary(12))
+    blob: Mapped[bytes] = mapped_column(LargeBinary)
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ConfirmToken(Base):
+    __tablename__ = "confirm_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class ResetToken(Base):
+    __tablename__ = "reset_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(32), ForeignKey("accounts.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class OneTimePrekey(Base):

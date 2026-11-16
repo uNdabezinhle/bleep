@@ -53,6 +53,52 @@ export const api = {
     req("/v1/handles", { method: "PUT", headers: headers(token), body: JSON.stringify({ handle }) }),
   resolveHandle: (token: string, handle: string) =>
     req(`/v1/handles/${encodeURIComponent(handle)}`, { headers: headers(token) }),
+  resolveShort: (token: string, shortId: string) =>
+    req(`/v1/ids/${encodeURIComponent(shortId)}`, { headers: headers(token) }),
+  createLogin: (email: string, password: string) =>
+    req("/v1/accounts", { method: "POST", headers: headers(), body: JSON.stringify({ email, password }) }),
+  loginAccount: (email: string, password: string) =>
+    req("/v1/accounts/login", { method: "POST", headers: headers(), body: JSON.stringify({ email, password }) }),
+  changePassword: (accountToken: string, current_password: string, new_password: string) =>
+    req("/v1/accounts/password", {
+      method: "POST",
+      headers: headers(accountToken),
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  addDevice: (accountToken: string, body: unknown) =>
+    req("/v1/accounts/devices", { method: "POST", headers: headers(accountToken), body: JSON.stringify(body) }),
+  devices: (token: string) => req("/v1/accounts/devices", { headers: headers(token) }),
+  revokeDevice: (token: string, deviceId: string) =>
+    req(`/v1/accounts/devices/${deviceId}/revoke`, { method: "POST", headers: headers(token), body: "{}" }),
+  eraseDeviceRemote: (token: string, deviceId: string) =>
+    req(`/v1/accounts/devices/${deviceId}/erase`, { method: "POST", headers: headers(token), body: "{}" }),
+  recover: (email: string) =>
+    req("/v1/accounts/recover", { method: "POST", headers: headers(), body: JSON.stringify({ email }) }),
+  recoverComplete: (token: string, password: string) =>
+    req("/v1/accounts/recover/complete", { method: "POST", headers: headers(), body: JSON.stringify({ token, password }) }),
+  history: (token: string) => req("/v1/history", { headers: headers(token) }),
+  putHistory: (token: string, body: unknown) =>
+    req("/v1/history", { method: "PUT", headers: headers(token), body: JSON.stringify(body) }),
+  directory: (token: string, q: string) =>
+    req(`/v1/directory?q=${encodeURIComponent(q)}`, { headers: headers(token) }),
+  dropHandle: (token: string) => req("/v1/handles", { method: "DELETE", headers: headers(token) }),
+  closeAccount: (accountToken: string, password: string) =>
+    req("/v1/accounts/close", { method: "POST", headers: headers(accountToken), body: JSON.stringify({ password }) }),
+  confirmAccount: (token: string) =>
+    req("/v1/accounts/confirm", { method: "POST", headers: headers(), body: JSON.stringify({ token }) }),
+  putHistoryFile: (token: string, fileId: string, body: unknown) =>
+    req(`/v1/history/files/${encodeURIComponent(fileId)}`, { method: "PUT", headers: headers(token), body: JSON.stringify(body) }),
+  getHistoryFile: (token: string, fileId: string) =>
+    req(`/v1/history/files/${encodeURIComponent(fileId)}`, { headers: headers(token) }),
+  listHistoryExtras: (token: string) => req("/v1/history/extras", { headers: headers(token) }),
+  getHistoryExtra: (token: string, extraId: string) =>
+    req(`/v1/history/extras/${encodeURIComponent(extraId)}`, { headers: headers(token) }),
+  putHistoryExtra: (token: string, extraId: string, body: unknown) =>
+    req(`/v1/history/extras/${encodeURIComponent(extraId)}`, {
+      method: "PUT",
+      headers: headers(token),
+      body: JSON.stringify(body),
+    }),
 };
 
 export function wakeUrl(token: string): string {

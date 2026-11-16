@@ -4,6 +4,10 @@ COPY package.json ./
 RUN npm install
 COPY . .
 COPY hashes-build.mjs /src/hashes-build.mjs
+ARG VITE_TURN_USER=bleep
+ARG VITE_TURN_PASS=bleep-dev
+ENV VITE_TURN_USER=$VITE_TURN_USER \
+    VITE_TURN_PASS=$VITE_TURN_PASS
 RUN npm run build && node hashes-build.mjs
 
 FROM nginx:1.27-alpine

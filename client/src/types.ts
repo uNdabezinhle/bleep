@@ -7,12 +7,15 @@ export type Peer = {
   edPk: string;
   xPk: string;
   displayName: string;
+  handle?: string;
+  nickname?: string;
   verified: boolean;
   lastSafety?: string;
   safetyChanged?: boolean;
   blocked: boolean;
   accepted: boolean;
   region: string;
+  avatarId?: string;
 };
 
 export type ThreadKind = "dm" | "group" | "chamber" | "status";
@@ -27,6 +30,9 @@ export type Thread = {
   unread: number;
   pinned: boolean;
   muted: boolean;
+  mutedUntil?: number | null;
+  replyTo?: string;
+  replyText?: string;
   archived: boolean;
   disappearingSec: number | null;
   receipts: boolean;
@@ -59,6 +65,8 @@ export type Message = {
   status?: "queued" | "sent" | "delivered" | "failed" | "read";
   viewOnce?: boolean;
   viewed?: boolean;
+  replyTo?: string;
+  replyText?: string;
   chamberInvite?: boolean;
   burnAt?: number;
   groupId?: string;
@@ -85,6 +93,15 @@ export type Settings = {
   diagnostics: boolean;
   region: string;
   handle?: string;
+  shortId?: string;
+  recoverySeed?: string;
+  deviceId?: string;
+  deviceCredential?: string;
+  accountEmail?: string;
+  historyGeneration?: number;
+  emailConfirmed?: boolean;
+  confirmNote?: string;
+  avatarId?: string;
 };
 
 export type ChamberMeta = {
@@ -96,6 +113,7 @@ export type ChamberMeta = {
   createdAt: number;
   unlocked: boolean;
   unread: number;
+  relayToken?: string;
 };
 
 export type PrekeyHold = { id: number; sk: string; pk: string };
@@ -113,6 +131,8 @@ export type VaultSnapshot = {
   statuses: StatusItem[];
   groups: Record<string, GroupState>;
   prekeys: { spk: PrekeyHold; opks: PrekeyHold[] };
+  androidPocket?: unknown;
+  androidPocketKnown?: boolean;
 };
 
 export type StatusItem = {
@@ -121,6 +141,8 @@ export type StatusItem = {
   fromName: string;
   text?: string;
   attachmentId?: string;
+  mime?: string;
+  name?: string;
   at: number;
   until: number;
 };

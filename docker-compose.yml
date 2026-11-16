@@ -3,6 +3,7 @@
 #
 #   docker compose up --build
 #   open http://localhost:8090
+#   or:  scripts/spin.ps1   (box + APK on /download + optional tunnel)
 #
 # Two people on one machine: http://localhost:8090/?p=alice and /?p=bob
 
@@ -32,7 +33,7 @@ services:
       BLEEP_TOKEN_SECRET: ${BLEEP_TOKEN_SECRET:-dev-only-change-me}
       BLEEP_OPS_TOKEN: ${BLEEP_OPS_TOKEN:-dev-ops}
       BLEEP_MAX_TTL_SECONDS: ${BLEEP_MAX_TTL_SECONDS:-129600}
-      BLEEP_ENV: box
+      BLEEP_ENV: ${BLEEP_ENV:-box}
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,9 +51,15 @@ services:
     restart: unless-stopped
 
   web:
-    build: ./client
+    build:
+      context: ./client
+      args:
+        VITE_TURN_USER: ${TURN_USER:-bleep}
+        VITE_TURN_PASS: ${TURN_PASS:-bleep-dev}
     ports:
       - "8090:80"
+    volumes:
+      - web-download:/usr/share/nginx/html/download
     depends_on:
       relay:
         condition: service_healthy
@@ -60,22 +67,51 @@ services:
 
   coturn:
     image: coturn/coturn:4.6.2
+    # Host network: relay ports must be the same on the VM and in the
+    # XOR-RELAYED-ADDRESS. Docker port publishing SNATs that range.
+    network_mode: host
+    environment:
+      TURN_USER: ${TURN_USER:-bleep}
+      TURN_PASS: ${TURN_PASS:-bleep-dev}
+      TURN_REALM: ${TURN_REALM:-bleep.za}
+      # OCI gives the guest a private address and DNAT's the public one.
+      # Set PUBLIC/PRIVATE (for example 129.0.0.1/10.0.0.5) on a cloud VM.
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - "--log-file=stdout"
-      - "--listening-port=3478"
-      - "--min-port=49160"
-      - "--max-port=49200"
-      - "--fingerprint"
-      - "--lt-cred-mech"
-      - "--user=${TURN_USER:-bleep}:${TURN_PASS:-bleep-dev}"
-      - "--realm=${TURN_REALM:-bleep.za}"
-      - "--no-tls"
-      - "--no-dtls"
-      - "--no-cli"
-    ports:
-      - "3478:3478"
-      - "3478:3478/udp"
+      - |
+        set -eu
+        ext=""
+        if [ -n "$$TURN_EXTERNAL_IP" ]; then
+          ext="--external-ip=$$TURN_EXTERNAL_IP"
+        fi
+        # Relay to public peers only. Direct calls still use host candidates.
+        exec turnserver \
+          --log-file=stdout \
+          --listening-port=3478 \
+          --min-port=49160 \
+          --max-port=49200 \
+          --fingerprint \
+          --lt-cred-mech \
+          --user="$$TURN_USER:$$TURN_PASS" \
+          --realm="$$TURN_REALM" \
+          --no-tls \
+          --no-dtls \
+          --no-cli \
+          --no-multicast-peers \
+          --denied-peer-ip=0.0.0.0-0.255.255.255 \
+          --denied-peer-ip=10.0.0.0-10.255.255.255 \
+          --denied-peer-ip=100.64.0.0-100.127.255.255 \
+          --denied-peer-ip=127.0.0.0-127.255.255.255 \
+          --denied-peer-ip=169.254.0.0-169.254.255.255 \
+          --denied-peer-ip=172.16.0.0-172.31.255.255 \
+          --denied-peer-ip=192.0.2.0-192.0.2.255 \
+          --denied-peer-ip=192.168.0.0-192.168.255.255 \
+          --denied-peer-ip=198.18.0.0-198.19.255.255 \
+          --denied-peer-ip=240.0.0.0-255.255.255.255 \
+          $$ext
     restart: unless-stopped
 
 volumes:
   pgdata:
+  web-download:

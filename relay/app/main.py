@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import wake
@@ -21,7 +21,8 @@ from .b64 import b64d, b64e
 from .config import settings
 from .crypto import auth_message, registration_message, verify_ed25519
 from .db import Base, SessionLocal, engine, get_session
-from .models import DemandLog, Envelope, Mailbox, OneTimePrekey
+from .accounts import guard_device, router as account_router
+from .models import Account, DemandLog, Device, Envelope, HistoryBlob, HistoryExtra, HistoryFile, Mailbox, OneTimePrekey
 from .rate import check_drop, check_handle, check_prekey
 from .schemas import (
     AuthIn,
@@ -38,12 +39,14 @@ from .schemas import (
     SignedPrekeyIn,
     TokenOut,
 )
+from .shortid import assign_short_id
 from .ttl import sweeper
 from .util import (
     HANDLE_RE,
     client_ip,
     hour_band,
     new_id,
+    normalize_short_id,
     require_region,
     utcnow,
     valid_mailbox_id,
@@ -53,9 +56,26 @@ log = logging.getLogger("bleep")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 @asynccontextmanager
+def _add_account_id(sync_conn) -> None:
+    insp = inspect(sync_conn)
+    if "mailboxes" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("mailboxes")}
+    if "account_id" not in cols:
+        sync_conn.execute(text("ALTER TABLE mailboxes ADD COLUMN account_id VARCHAR(32)"))
+    if "short_id" not in cols:
+        sync_conn.execute(text("ALTER TABLE mailboxes ADD COLUMN short_id VARCHAR(8)"))
+    sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_mailboxes_short_id ON mailboxes (short_id)"))
+    if "accounts" in insp.get_table_names():
+        acols = {c["name"] for c in insp.get_columns("accounts")}
+        if "email_confirmed" not in acols:
+            sync_conn.execute(text("ALTER TABLE accounts ADD COLUMN email_confirmed BOOLEAN NOT NULL DEFAULT TRUE"))
+
+
 async def lifespan(_app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_account_id)
     stop = asyncio.Event()
     task = asyncio.create_task(sweeper(stop))
     yield
@@ -70,9 +90,10 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Public Bleep relay",
     version="0.1.0",
-    description="Sealed mailboxes. No search. No graph. No plaintext.",
+    description="Sealed mailboxes. Handle prefix directory. No email search. No graph. No plaintext.",
     lifespan=lifespan,
 )
+app.include_router(account_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,7 +119,7 @@ async def health(_region: str = Depends(require_region)):
         region=settings.bleep_region,
         fail_closed=True,
         env=settings.bleep_env,
-        holdings="sealed envelopes with TTL; no plaintext; no sender column",
+        holdings="sealed envelopes with TTL; sealed history blob; sealed file bytes; sealed extra blobs; email and password verifier; no plaintext; no sender column",
     )
 
 
@@ -130,12 +151,33 @@ async def token(
         raise HTTPException(status_code=400, detail="bad b64") from exc
     if not verify_ed25519(box.identity_ed25519, auth_message(body.mailbox_id, body.nonce), sig):
         raise HTTPException(status_code=401, detail="bad signature")
+    device_id = None
+    if box.account_id:
+        if not body.device_id or not body.device_credential:
+            raise HTTPException(status_code=401, detail="device credential required")
+        dev = await session.get(Device, body.device_id)
+        from .accounts import _hash_cred
+
+        if (
+            not dev
+            or dev.account_id != box.account_id
+            or dev.credential_hash != _hash_cred(body.device_credential)
+        ):
+            raise HTTPException(status_code=401, detail="device credential required")
+        if dev.erase_requested:
+            raise HTTPException(status_code=403, detail="erase")
+        if dev.revoked:
+            raise HTTPException(status_code=401, detail="device revoked")
+        device_id = dev.id
     box.last_connect_band = hour_band()
+    short_id = await assign_short_id(session, box)
     await session.commit()
     return TokenOut(
-        token=mint_token(box.id),
+        token=mint_token(box.id, device_id),
         mailbox_id=box.id,
         region=settings.bleep_region,
+        short_id=short_id,
+        handle=box.handle,
     )
 
 
@@ -191,8 +233,15 @@ async def register(
         if len(pub) != 32:
             raise HTTPException(status_code=400, detail="bad opk length")
         session.add(OneTimePrekey(mailbox_id=box.id, key_id=opk.key_id, pub=pub))
+    short_id = await assign_short_id(session, box)
     await session.commit()
-    return TokenOut(token=mint_token(box.id), mailbox_id=box.id, region=settings.bleep_region)
+    return TokenOut(
+        token=mint_token(box.id),
+        mailbox_id=box.id,
+        region=settings.bleep_region,
+        short_id=short_id,
+        handle=box.handle,
+    )
 
 
 @app.get("/v1/mailboxes/{mailbox_id}/prekey", response_model=PrekeyBundleOut)
@@ -204,6 +253,7 @@ async def fetch_prekey(
 ):
     valid_mailbox_id(mailbox_id)
     check_prekey(principal.mailbox_id)
+    await guard_device(principal, session)
     box = await session.get(Mailbox, mailbox_id)
     if not box or box.unlink_dead:
         raise HTTPException(status_code=404, detail="no mailbox")
@@ -238,6 +288,7 @@ async def replenish_prekeys(
 ):
     if principal.mailbox_id != mailbox_id:
         raise HTTPException(status_code=403, detail="not your mailbox")
+    await guard_device(principal, session)
     box = await session.get(Mailbox, mailbox_id)
     if not box or box.unlink_dead:
         raise HTTPException(status_code=404, detail="no mailbox")
@@ -261,7 +312,7 @@ async def unlink(
 ):
     if principal.mailbox_id != mailbox_id:
         raise HTTPException(status_code=403, detail="not your mailbox")
-    box = await session.get(Mailbox, mailbox_id)
+    box = await guard_device(principal, session)
     if not box:
         raise HTTPException(status_code=404, detail="no mailbox")
     box.unlink_dead = True
@@ -287,6 +338,7 @@ async def drop_mail(
     _region: str = Depends(require_region),
 ):
     """Store a sealed blob. Authenticated mailbox is used for quota only — not stored."""
+    await guard_device(principal, session)
     valid_mailbox_id(body.dest_mailbox_id)
     check_drop(principal.mailbox_id)
     dest = await session.get(Mailbox, body.dest_mailbox_id)
@@ -328,6 +380,7 @@ async def fetch_mail(
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
 ):
+    await guard_device(principal, session)
     box = await session.get(Mailbox, principal.mailbox_id)
     if not box or box.unlink_dead:
         raise HTTPException(status_code=401, detail="dead mailbox")
@@ -361,6 +414,7 @@ async def publish_handle(
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
 ):
+    await guard_device(principal, session)
     handle = body.handle.strip().lower()
     if not HANDLE_RE.match(handle):
         raise HTTPException(status_code=400, detail="handle shape")
@@ -386,12 +440,37 @@ async def drop_handle(
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
 ):
-    box = await session.get(Mailbox, principal.mailbox_id)
+    box = await guard_device(principal, session)
     if not box:
         raise HTTPException(status_code=404, detail="no mailbox")
     box.handle = None
     await session.commit()
     return {"ok": True}
+
+
+@app.get("/v1/ids/{short_id}")
+async def resolve_short_id(
+    short_id: str,
+    request: Request,
+    principal: Principal = Depends(require_mailbox),
+    session: AsyncSession = Depends(get_session),
+    _region: str = Depends(require_region),
+):
+    await guard_device(principal, session)
+    check_handle(client_ip(request) + ":" + principal.mailbox_id)
+    compact = normalize_short_id(short_id)
+    if not compact:
+        raise HTTPException(status_code=400, detail="bad id")
+    box = await session.scalar(select(Mailbox).where(Mailbox.short_id == compact, Mailbox.unlink_dead.is_(False)))
+    if not box:
+        raise HTTPException(status_code=404, detail="no id")
+    return {
+        "short_id": compact,
+        "mailbox_id": box.id,
+        "handle": box.handle,
+        "identity_ed25519_b64": b64e(box.identity_ed25519),
+        "identity_x25519_b64": b64e(box.identity_x25519),
+    }
 
 
 @app.get("/v1/handles/{handle}", response_model=HandleOut)
@@ -402,6 +481,7 @@ async def resolve_handle(
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
 ):
+    await guard_device(principal, session)
     check_handle(client_ip(request) + ":" + principal.mailbox_id)
     h = handle.strip().lower()
     box = await session.scalar(select(Mailbox).where(Mailbox.handle == h, Mailbox.unlink_dead.is_(False)))
@@ -484,6 +564,22 @@ async def ops_holdings(
     n_env = await session.scalar(
         select(func.count()).select_from(Envelope).where(Envelope.dest_mailbox_id == mailbox_id)
     )
+    account = await session.get(Account, box.account_id) if box.account_id else None
+    hist = await session.get(HistoryBlob, box.account_id) if box.account_id else None
+    n_files = (
+        await session.scalar(
+            select(func.count()).select_from(HistoryFile).where(HistoryFile.account_id == box.account_id)
+        )
+        if box.account_id
+        else 0
+    )
+    n_extras = (
+        await session.scalar(
+            select(func.count()).select_from(HistoryExtra).where(HistoryExtra.account_id == box.account_id)
+        )
+        if box.account_id
+        else 0
+    )
     return {
         "mailbox_id": mailbox_id,
         "exists": True,
@@ -496,10 +592,15 @@ async def ops_holdings(
         "envelopes_in_flight": int(n_env or 0),
         "envelopes_are": "sealed blobs; operator cannot read",
         "who_they_talked_to": "not held — no sender column",
-        "transcript": "not held",
+        "transcript": "not held as plaintext; a sealed history blob may exist for the account",
         "guardian_hits": "not held",
         "chamber": "mailboxes are not flagged as chambers",
         "phone_number": "not held",
+        "email": account.email if account else None,
+        "history_bytes": hist.size_bytes if hist else 0,
+        "history_is": "sealed blob; operator cannot read" if hist else "none",
+        "history_files": int(n_files or 0),
+        "history_extras": int(n_extras or 0),
     }
 
 

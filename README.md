@@ -21,6 +21,19 @@ docker compose up --build
 
 The invite client is published on **http://localhost:8090** (8080 is often taken by other local stacks).
 
+Public test, pilot, and production boxes are three always-on VMs on one Oracle Cloud Always Free tenancy in Johannesburg. Steps, firewall, and the TLS overlay are in [`deploy/README.md`](deploy/README.md). Cloudflare can host the DNS. It cannot host the relay, Postgres, or in-region TURN. A laptop tunnel does not publish TURN.
+
+### Self-host spin (box + downloadable APK)
+
+One script starts the box, builds the debug Android APK on this machine, and serves it at `/download/bleep.apk` with SHA-256 on `/hashes.html`. Optional Cloudflare quick tunnel for a public HTTPS URL. **No IPA** (no iOS tree; Apple signing needs a Mac).
+
+```powershell
+.\scripts\spin.ps1
+.\scripts\spin.ps1 -NoTunnel
+```
+
+Linux/OpenStack VM later: `./scripts/spin.sh`. On the phone: allow unknown sources, install the APK, paste the printed box URL as Public Bleep. Debug-signed. Not an audit. Keep the PC awake if the tunnel is on.
+
 Open:
 
 - http://localhost:8090/?p=alice
