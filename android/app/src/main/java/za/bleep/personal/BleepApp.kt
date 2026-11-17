@@ -6,6 +6,8 @@ import za.bleep.personal.store.Vault
 class BleepApp : Application() {
     lateinit var vault: Vault
         private set
+    var live: za.bleep.personal.protocol.Session? = null
+    var livePin: String = ""
 
     override fun onCreate() {
         super.onCreate()

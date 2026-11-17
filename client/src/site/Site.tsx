@@ -105,7 +105,9 @@ function Faq() {
     ["Can a stranger message me?", "They can send a request if they have your code. A thread opens after you accept."],
     ["Is the download the Play Store app?", "No. The file on the hash page is a debug-signed APK for this box, with its SHA-256 beside it. It is not a Play release and it is not an audit."],
     ["Can people screenshot a chat?", "The Android app blocks the system screenshot and screen recording while it is open. A photograph of the screen still works. The browser cannot stop a screenshot. View-once and Chambers say the same."],
+    ["Does mail arrive if Bleep is closed?", "A browser can show a notice that says Bleep, with no message and no sender, after you turn notices on and this box has a push key. The Android app can keep listening while it is in the background. A force-stop ends that. Opening Bleep still collects the sealed mail."],
     ["Where does a message live?", "On the devices in the conversation, and in a sealed history blob for the account until unlink. The relay cannot read that blob. Transport envelopes expire."],
+    ["Does a second device show the same chats?", "A browser and a phone that use the same recovery code share the same direct chats and groups. Chamber text stays out of that shared history. A second device does not delete mail it cannot open. The device that can open it keeps the copy, then shared history shows the chat."],
     ["What is a Chamber?", "A separate ID, its own PIN, and a burn date. Unlocking Bleep does not unlock a Chamber."],
     ["Is there an iPhone app?", "No. There is no iOS build. Apple signing would need a Mac, and this tree does not have one."],
   ];

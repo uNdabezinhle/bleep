@@ -47,8 +47,13 @@ export const api = {
   drop: (token: string, body: unknown) =>
     req("/v1/mail", { method: "POST", headers: headers(token), body: JSON.stringify(body) }),
   fetch: (token: string) => req("/v1/mail", { headers: headers(token) }),
+  ackMail: (token: string, ids: string[]) =>
+    req("/v1/mail/ack", { method: "POST", headers: headers(token), body: JSON.stringify({ ids: ids.slice(0, 50) }) }),
   presence: (token: string, ids: string[]) =>
     req("/v1/presence?" + ids.slice(0, 30).map((id) => "mailbox_id=" + encodeURIComponent(id)).join("&"), { headers: headers(token) }),
+  pushKey: (token: string) => req("/v1/push/vapid", { headers: headers(token) }),
+  putPush: (token: string, body: unknown) =>
+    req("/v1/push", { method: "PUT", headers: headers(token), body: JSON.stringify(body) }),
   channels: (token: string) => req("/v1/channels", { headers: headers(token) }),
   createChannel: (token: string, name: string) =>
     req("/v1/channels", { method: "POST", headers: headers(token), body: JSON.stringify({ name }) }),

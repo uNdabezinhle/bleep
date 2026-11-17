@@ -128,6 +128,8 @@ export type VaultSnapshot = {
   threads: Record<string, Thread>;
   messages: Record<string, Message[]>;
   sessions: Record<string, SessionRec>;
+  /** Ratchet dumps shared across devices. A history pull stores these and does not load them into `sessions`. */
+  sharedSessions?: Record<string, SerializedRatchet>;
   settings: Settings;
   requests: Message[];
   blocked: string[];

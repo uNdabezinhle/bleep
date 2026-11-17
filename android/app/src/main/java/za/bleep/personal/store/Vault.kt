@@ -15,6 +15,7 @@ class Vault(ctx: Context) {
     private val file = File(ctx.filesDir, "vault.enc")
     fun exists(): Boolean = file.exists()
 
+    @Synchronized
     fun save(pin: String, json: JSONObject) {
         val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
         val key = derive(pin, salt)
@@ -30,6 +31,7 @@ class Vault(ctx: Context) {
         file.writeText(wrap.toString())
     }
 
+    @Synchronized
     fun load(pin: String): JSONObject {
         val wrap = JSONObject(file.readText())
         val key = derive(pin, b64d(wrap.getString("salt")))

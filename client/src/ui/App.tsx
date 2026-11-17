@@ -117,6 +117,7 @@ export function App({ path = "/app" }: { path?: string }) {
   const [gate, setGate] = useState<Gate>("boot");
   const [tab, setTab] = useState<Tab>("chats");
   const [listMode, setListMode] = useState<"chats" | "chambers" | "groups" | "channels">("chats");
+  const [leaveId, setLeaveId] = useState<string | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [find, setFind] = useState("");
@@ -254,17 +255,22 @@ export function App({ path = "/app" }: { path?: string }) {
                 </div>
               )}
               {threads.map((t) => (
-                <button key={t.id} className={"row" + (threadId === t.id ? " on" : "")} onClick={() => setThreadId(t.id)}>
-                  <Face id={t.kind === "dm" ? snap.peers[t.peerMailboxId || ""]?.avatarId : undefined} letter={t.title} ember={t.kind === "chamber"} />
-                  <div className="meta">
-                    <div className="name">{t.title}</div>
-                    <div className="preview">{t.lockedStub ? "Chamber active · locked" : t.lastPreview || " "}</div>
-                  </div>
-                  <div>
-                    <div className="when">{fmtTime(t.lastAt)}</div>
-                    {t.unread > 0 && <div className="badge">{t.unread}</div>}
-                  </div>
-                </button>
+                <div key={t.id}>
+                  <button className={"row" + (threadId === t.id ? " on" : "")} onClick={() => setThreadId(t.id)}>
+                    <Face id={t.kind === "dm" ? snap.peers[t.peerMailboxId || ""]?.avatarId : undefined} letter={t.title} ember={t.kind === "chamber"} />
+                    <div className="meta">
+                      <div className="name">{t.title}</div>
+                      <div className="preview">{t.lockedStub ? "Chamber active · locked" : t.lastPreview || " "}</div>
+                    </div>
+                    <div>
+                      <div className="when">{fmtTime(t.lastAt)}</div>
+                      {t.unread > 0 && <div className="badge">{t.unread}</div>}
+                    </div>
+                  </button>
+                  {listMode === "groups" && t.groupId && (
+                    <button type="button" className="ghost" onClick={() => setLeaveId(t.groupId || null)}>Leave group</button>
+                  )}
+                </div>
               ))}
             </div>}
           </aside>
@@ -321,6 +327,29 @@ export function App({ path = "/app" }: { path?: string }) {
           onClose={() => setGroupOpen(false)}
           onCreated={(id) => { setTab("chats"); setListMode("groups"); setThreadId(id); }}
         />
+      )}
+      {leaveId && (
+        <div className="sheet" onClick={() => setLeaveId(null)}>
+          <div className="panel" onClick={(e) => e.stopPropagation()}>
+            <h3>Leave group</h3>
+            <p>Leave this group? People already in it keep their copy.</p>
+            <div className="actions">
+              <button
+                className="danger"
+                onClick={() => {
+                  const id = leaveId;
+                  void rt.leaveGroup(id).then(() => {
+                    setLeaveId(null);
+                    if (threadId === "g:" + id) setThreadId(null);
+                  }).catch((e: Error) => alert(e.message));
+                }}
+              >
+                Leave group
+              </button>
+              <button onClick={() => setLeaveId(null)}>Stay</button>
+            </div>
+          </div>
+        </div>
       )}
       {rt.call.phase !== "idle" && <CallOverlay />}
       {hits && (
@@ -675,6 +704,7 @@ function ThreadView({
   const [viewOnce, setViewOnce] = useState(false);
   const [recOn, setRecOn] = useState(false);
   const [menu, setMenu] = useState(false);
+  const [leaveAsk, setLeaveAsk] = useState(false);
   const [mediaOpen, setMediaOpen] = useState(false);
   const [nick, setNick] = useState(peer?.nickname ?? "");
   const recRef = useRef<MediaRecorder | null>(null);
@@ -741,6 +771,29 @@ function ThreadView({
                 onNick={setNick}
                 onDone={() => setMenu(false)}
               />
+            )}
+            {thread.kind === "group" && thread.groupId && (
+              <div className="actions">
+                {leaveAsk ? (
+                  <>
+                    <p className="hint">Leave this group? People already in it keep their copy.</p>
+                    <button
+                      className="danger"
+                      onClick={() => {
+                        void rt.leaveGroup(thread.groupId || "").then(() => {
+                          setMenu(false);
+                          onBack();
+                        }).catch((e: Error) => alert(e.message));
+                      }}
+                    >
+                      Leave group
+                    </button>
+                    <button onClick={() => setLeaveAsk(false)}>Stay</button>
+                  </>
+                ) : (
+                  <button onClick={() => setLeaveAsk(true)}>Leave group</button>
+                )}
+              </div>
             )}
             {thread.kind === "chamber" && thread.chamberId && (
               <div className="actions">
@@ -1428,6 +1481,13 @@ function SettingsPane({ slide, onSlide, onErased }: { slide: number; onSlide: (i
                 <option value="strict">strict</option>
               </select>
             </div>
+          </div>
+          <div>
+            <h3>Background notice</h3>
+            <p className="note">The notice says Bleep. It does not include the message or the sender. The browser push service can see that a notice was sent. This box sends notices only after a push key is set.</p>
+            <button type="button" className="ghost" onClick={() => void rt.enablePush().then((note) => alert(note)).catch((e) => alert((e as Error).message))}>
+              Notify this browser
+            </button>
           </div>
           <div id="lock-timer">
             <h3>Lock & data</h3>

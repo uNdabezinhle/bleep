@@ -223,49 +223,60 @@ export type Incoming = {
   mailboxId: string;
 };
 
+export type OpenedMail = { ack: boolean; incoming: Incoming | null };
+
 export function openIncoming(
   snap: VaultSnapshot,
   blobB64: string,
   holds: { spk: SpkHold; opks: OpkHold[] },
 ): Incoming | null {
+  return openForAck(snap, blobB64, holds).incoming;
+}
+
+/** ack is true only after a bad signature or a ratchet open. A ratchet miss stays on the relay. */
+export function openForAck(
+  snap: VaultSnapshot,
+  blobB64: string,
+  holds: { spk: SpkHold; opks: OpkHold[] },
+): OpenedMail {
   let innerBytes: Uint8Array;
   try {
     innerBytes = openOuter(snap.identity.xSk, b64d(blobB64));
   } catch {
-    return null;
+    return { ack: false, incoming: null };
   }
   const inner = decodeInner(innerBytes);
-  if (!verifyInner(inner)) return null;
+  if (!verifyInner(inner)) return { ack: true, incoming: null };
   const fromEd = b64d(inner.sid);
   const fromX = b64d(inner.spk);
   const peerId = inner.mid || findPeerId(snap, fromEd) || "pending:" + b64e(fromEd).slice(0, 12);
 
   let st = getRatchet(snap, peerId);
   if (!st) {
-    if (inner.t !== "pkmsg" && inner.t !== "intro") return null;
-    if (!inner.ek) return null;
+    if (inner.t !== "pkmsg" && inner.t !== "intro") return { ack: false, incoming: null };
+    if (!inner.ek) return { ack: false, incoming: null };
     const aliceEph = b64d(inner.ek);
     const opk = inner.used_opk != null ? holds.opks.find((k) => k.id === inner.used_opk) : undefined;
     let sk = x3dhBob(snap.identity.xSk, holds.spk.sk, fromX, aliceEph, opk?.sk ?? null);
     if (inner.pq) {
-      if (!snap.identity.pqSeed || snap.identity.pqSeed.length !== 64) return null;
+      if (!snap.identity.pqSeed || snap.identity.pqSeed.length !== 64) return { ack: false, incoming: null };
       try {
         sk = hybridRoot(sk, pqDecaps(b64d(inner.pq), snap.identity.pqSeed));
       } catch {
-        return null;
+        return { ack: false, incoming: null };
       }
     }
     st = initBob(sk, holds.spk.sk, holds.spk.pk);
-    snap.sessions[peerId] = {
-      peerMailboxId: peerId,
-      ratchet: dumpRatchet(st),
-      established: true,
-    };
   }
-  const pt = ratchetDecrypt(st, inner.h, b64d(inner.ct));
+  let pt: Uint8Array;
+  try {
+    pt = ratchetDecrypt(st, inner.h, b64d(inner.ct));
+  } catch {
+    return { ack: false, incoming: null };
+  }
   putRatchet(snap, peerId, st);
   const payload = JSON.parse(fromUtf8(pt)) as Payload;
-  return { payload, fromEd, fromX, innerType: inner.t, mailboxId: peerId };
+  return { ack: true, incoming: { payload, fromEd, fromX, innerType: inner.t, mailboxId: peerId } };
 }
 
 function findPeerId(snap: VaultSnapshot, edPk: Uint8Array): string | null {

@@ -70,6 +70,11 @@ class Relay(var base: String = "http://10.0.2.2:8090") {
         return r.optJSONArray("items") ?: JSONArray()
     }
 
+    fun ack(token: String, ids: JSONArray) {
+        if (ids.length() == 0) return
+        req("POST", "/v1/mail/ack", JSONObject().put("ids", ids), token)
+    }
+
     fun unlink(mailboxId: String, token: String): JSONObject =
         req("POST", "/v1/mailboxes/$mailboxId/unlink", JSONObject(), token)
 

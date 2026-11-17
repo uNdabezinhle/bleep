@@ -34,6 +34,9 @@ services:
       BLEEP_OPS_TOKEN: ${BLEEP_OPS_TOKEN:-dev-ops}
       BLEEP_MAX_TTL_SECONDS: ${BLEEP_MAX_TTL_SECONDS:-129600}
       BLEEP_ENV: ${BLEEP_ENV:-box}
+      BLEEP_VAPID_PUBLIC: ${BLEEP_VAPID_PUBLIC:-}
+      BLEEP_VAPID_PRIVATE: ${BLEEP_VAPID_PRIVATE:-}
+      BLEEP_VAPID_SUB: ${BLEEP_VAPID_SUB:-mailto:hello@bleep.de5.net}
     depends_on:
       postgres:
         condition: service_healthy

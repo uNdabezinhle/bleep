@@ -37,6 +37,12 @@ A device-only mailbox (no account) still uses a random mailbox id and random
 keys. The mailbox routing ID is not the identity public key. Remote unlink
 marks the mailbox dead and the client registers a new routing ID (T13).
 
+`GET /v1/mail` returns sealed envelopes and does not delete them.
+`POST /v1/mail/ack` deletes ids for that mailbox only. A client acks an
+envelope after the signature checks and the ratchet opens. If the ratchet
+does not open, the envelope stays until a device that can open it acks it,
+or until the TTL sweep. There is still no sender column.
+
 ## Account, devices, history, directory
 
 The relay stores the normalized email, an Argon2id verifier, one mailbox id,
@@ -54,11 +60,21 @@ History is one sealed blob per account (ciphertext, 12-byte nonce, generation,
 size). The key is HKDF-SHA-256(seed, salt=`bleep-hist`, info=`bleep-history-v1`,
 32). There is no thread table and no sender column. Current blobs use
 `kind=shared-v1`. Shared fields are peers, threads, messages (text and
-attachment ids, not raw bytes), and requests. Each client keeps a pocket the
-other must round-trip unchanged: `web` holds that client's ratchet and
-settings, `android` holds the Android ratchet snapshot. Older `web` and
-`android` blobs still decrypt. Private keys, the recovery seed, and device
-credentials stay out of the blob.
+attachment ids, not raw bytes), and requests. A direct thread id is `dm:`
+plus the two mailbox ids in sorted order. A group thread id is `g:` plus
+the group id. Both clients show that thread. Chamber threads stay out of
+this blob. `sessions` holds one ratchet dump per peer, the same fields a
+client already stores (`dhsSk`, `dhsPk`, `dhr`, `rk`, `cks`, `ckr`, `ns`,
+`nr`, `pn`, `skipped`). A history pull keeps that dump beside the live
+session and does not load it. A send pulls first. If the dump is there, that
+send continues the same session and does not start another X3DH. The
+advanced dump is pushed immediately. A second stale generation stops the
+send. Each client also keeps a pocket the other must round-trip unchanged:
+`web` holds that client's settings, `android` holds the Android prekey
+snapshot. Older `web` and `android` blobs still decrypt. Private keys, the
+recovery seed, and device credentials stay out of the blob. Leaving a group
+is a sealed `ctrl` op `leave-group` to the current members. The relay still
+cannot read the group.
 
 Attachment bytes are separate rows at `PUT/GET /v1/history/files/{id}`
 (nonce, ciphertext, size, mime, name), same history key, same size cap as an
@@ -118,7 +134,7 @@ Authenticated drop is required (mailbox token) so unsigned mail cannot fill a
 box (T24/T25). The authenticated mailbox ID is used for quota and then
 discarded — it is not written next to the destination (T7).
 
-Wake-up (WebSocket) payload is `{"v":1,"wake":true}` only (T10).
+Wake-up (WebSocket and Web Push) payload is `{"v":1,"wake":true}` only (T10). A push subscription stores the browser endpoint. The notice does not include the message or the sender. Android listening is an opt-in foreground loop on the phone. It stops when the process is killed.
 
 ## Holdings the relay may produce
 

@@ -94,11 +94,21 @@ fun BleepRoot(app: BleepApp) {
     var pin by remember { mutableStateOf("") }
     var lastTouch by remember { mutableStateOf(System.currentTimeMillis()) }
     val scope = rememberCoroutineScope()
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     fun persist() {
         if (pin.isNotEmpty() && session.ready) {
+            app.live = session
+            app.livePin = pin
             try { app.vault.save(pin, session.snapshot()) } catch (_: Exception) { }
         }
         tick++
+    }
+    LaunchedEffect(gate, session.listenBackground) {
+        if (gate == "app" && session.listenBackground && pin.isNotEmpty()) {
+            app.live = session
+            app.livePin = pin
+            ListenService.start(ctx)
+        }
     }
 
     LaunchedEffect(gate) {
@@ -129,6 +139,8 @@ fun BleepRoot(app: BleepApp) {
         when (gate) {
             "setup" -> AccountPane(session, err) { p ->
                 pin = p
+                app.live = session
+                app.livePin = p
                 app.vault.save(p, session.snapshot())
                 gate = "app"
                 err = ""
@@ -139,6 +151,8 @@ fun BleepRoot(app: BleepApp) {
                 scope.launch {
                     try {
                         val snap = app.vault.load(p)
+                        app.live = session
+                        app.livePin = p
                         withContext(Dispatchers.IO) {
                             session.restore(snap)
                             session.pullHistory()
@@ -154,6 +168,10 @@ fun BleepRoot(app: BleepApp) {
                 }
             }
             "app" -> AppPane(session, tick, { persist() }, { gate = "lock" }, { pin = it }, {
+                session.listenBackground = false
+                ListenService.stop(ctx)
+                app.live = null
+                app.livePin = ""
                 app.vault.erase()
                 gate = "setup"
                 err = "This device was erased. A phone that never contacts the box keeps its files. This one just did."
@@ -490,6 +508,34 @@ fun MePane(session: Session, bump: () -> Unit, onPin: (String) -> Unit, onErased
             color = Mute,
             fontSize = 12.sp,
         )
+        val listenCtx = androidx.compose.ui.platform.LocalContext.current
+        val askListen = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) return@rememberLauncherForActivityResult
+            session.listenBackground = true
+            app.live = session
+            ListenService.start(listenCtx)
+            bump()
+        }
+        TextButton(onClick = {
+            if (session.listenBackground) {
+                session.listenBackground = false
+                ListenService.stop(listenCtx)
+                bump()
+                return@TextButton
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                val perm = android.Manifest.permission.POST_NOTIFICATIONS
+                if (listenCtx.checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    askListen.launch(perm)
+                    return@TextButton
+                }
+            }
+            session.listenBackground = true
+            app.live = session
+            ListenService.start(listenCtx)
+            bump()
+        }) { Text(if (session.listenBackground) "Stop listening" else "Listen in the background", color = Amber) }
+        Text("Checks for mail about every 20 seconds while Bleep stays in the background. The notice does not include the message. A force-stop ends it. This uses more battery.", color = Mute, fontSize = 12.sp)
         TextButton(onClick = {
             session.guardianMode = when (session.guardianMode) {
                 "off" -> "warn"
@@ -627,6 +673,7 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
     var groupName by remember { mutableStateOf("") }
     var picked by remember { mutableStateOf(setOf<String>()) }
     var making by remember { mutableStateOf(false) }
+    var leaving by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val statusPick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -697,11 +744,30 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
                 Text("No groups. A group stays small, and each person joins on purpose.", color = Mute)
             }
             session.groups.values.forEach { g ->
-                Text(
-                    g.name,
-                    color = TextC,
-                    modifier = Modifier.fillMaxWidth().clickable { openGroup(g.id) }.padding(12.dp),
-                )
+                val last = session.groupThreads["g:${g.id}"].orEmpty().lastOrNull { !it.deleted }
+                Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Text(g.name, color = TextC, modifier = Modifier.fillMaxWidth().clickable { openGroup(g.id) })
+                    if (last != null) Text(last.text.ifBlank { last.kind }, color = Mute, fontSize = 12.sp, maxLines = 1)
+                    if (leaving == g.id) {
+                        Text("Leave this group? People already in it keep their copy.", color = Mute, fontSize = 12.sp)
+                        Row {
+                            TextButton(onClick = {
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) { session.leaveGroup(g.id) }
+                                        leaving = null
+                                        bump()
+                                    } catch (e: Exception) {
+                                        err = e.message ?: "Could not leave the group."
+                                    }
+                                }
+                            }) { Text("Leave group", color = Bad) }
+                            TextButton(onClick = { leaving = null }) { Text("Stay", color = TextC) }
+                        }
+                    } else {
+                        TextButton(onClick = { leaving = g.id }) { Text("Leave group", color = Amber) }
+                    }
+                }
             }
             TextButton(onClick = { making = !making }) { Text(if (making) "Hide new group" else "New group", color = Amber) }
             if (making) {
@@ -847,11 +913,20 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
                 name.contains(q, true) || session.threads[p.mailboxId].orEmpty().any { m -> m.text.contains(q, true) }
             }
         }.forEach { p ->
-            Text(
-                chatName(p),
-                color = TextC,
-                modifier = Modifier.fillMaxWidth().clickable { open(p) }.padding(12.dp),
-            )
+            val last = session.threads[p.mailboxId].orEmpty().lastOrNull { !it.deleted }
+            Column(Modifier.fillMaxWidth().clickable { open(p) }.padding(vertical = 8.dp)) {
+                Text(chatName(p), color = TextC)
+                if (last != null) {
+                    val line = last.text.ifBlank {
+                        when (last.kind) {
+                            "photo" -> "Photo"
+                            "voice" -> "Voice note"
+                            else -> last.kind
+                        }
+                    }
+                    Text(line, color = Mute, fontSize = 12.sp, maxLines = 1)
+                }
+            }
         }
     }
 }

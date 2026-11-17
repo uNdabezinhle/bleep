@@ -68,6 +68,10 @@ class EnvelopeOut(BaseModel):
     expires_at: str
 
 
+class AckIn(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=50)
+
+
 class HandleIn(BaseModel):
     handle: str
 

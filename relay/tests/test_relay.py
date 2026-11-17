@@ -139,6 +139,41 @@ def test_fetch_is_opaque_blob():
         assert "sender" not in items[0]
 
 
+def test_fetch_keeps_blob_until_ack():
+    with client() as c:
+        a = register(c)
+        b = register(c)
+        other = register(c)
+        blob = dummy_blob()
+        dropped = c.post(
+            "/v1/mail",
+            json={"dest_mailbox_id": b["mailbox_id"], "blob_b64": blob},
+            headers={**HDR, "Authorization": f"Bearer {a['token']}"},
+        )
+        assert dropped.status_code == 202, dropped.text
+        eid = dropped.json()["id"]
+        auth_b = {**HDR, "Authorization": f"Bearer {b['token']}"}
+        first = c.get("/v1/mail", headers=auth_b)
+        assert first.status_code == 200
+        assert len(first.json()) == 1
+        assert first.json()[0]["blob_b64"] == blob
+        second = c.get("/v1/mail", headers=auth_b)
+        assert len(second.json()) == 1
+        assert second.json()[0]["id"] == eid
+        stranger = c.post(
+            "/v1/mail/ack",
+            json={"ids": [eid]},
+            headers={**HDR, "Authorization": f"Bearer {other['token']}"},
+        )
+        assert stranger.status_code == 204
+        still = c.get("/v1/mail", headers=auth_b)
+        assert len(still.json()) == 1
+        acked = c.post("/v1/mail/ack", json={"ids": [eid, "missing-id"]}, headers=auth_b)
+        assert acked.status_code == 204
+        empty = c.get("/v1/mail", headers=auth_b)
+        assert empty.json() == []
+
+
 def test_holdings_match_le_guide():
     with client() as c:
         a = register(c)

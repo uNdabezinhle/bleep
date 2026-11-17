@@ -14,6 +14,29 @@ import za.bleep.personal.net.AccountRequests
 
 class ProtocolTest {
     @Test
+    fun ratchetDumpKeepsCounters() {
+        val state = Ratchet.initBob(ByteArray(32) { 7 }, ByteArray(32) { 3 }, ByteArray(32) { 9 })
+        state.ns = 4
+        state.nr = 2
+        val back = Ratchet.load(Ratchet.dump(state))
+        assertEquals(4, back.ns)
+        assertEquals(2, back.nr)
+    }
+
+    @Test
+    fun leaveGroupDropsMemberAndBumpsVersion() {
+        val members = listOf(
+            GroupMember("aa", "ed", "admin"),
+            GroupMember("bb", "ed2", "member"),
+        )
+        val next = GroupOps.applyLeave(members, 1, "bb")
+        assertEquals(1, next!!.first.size)
+        assertEquals("aa", next.first[0].mailboxId)
+        assertEquals(2, next.second)
+        assertEquals(null, GroupOps.applyLeave(members, 1, "cc"))
+    }
+
+    @Test
     fun saIdPassingChecksumWarns() {
         assertTrue(Guardian.validSaId("9001015800088"))
         assertTrue(Guardian.scan("here is 9001015800088 for FICA").any { it.rule == "sa-id" })
@@ -122,6 +145,13 @@ class ProtocolTest {
         assertEquals("newer", merged.first { it.id == "a" }.text)
         assertEquals("file-aaaa", merged.first { it.id == "a" }.attachmentId)
         assertEquals("dm:aa:bb", dmThreadId("bb", "aa"))
+        assertEquals("bb", peerFromDm("dm:bb:aa", "aa"))
+        assertEquals("bb", peerFromDm("dm:aa:bb", "aa"))
+        val ordered = mergeSharedMessages(
+            listOf(SharedMsg("later", "second", 20, true)),
+            listOf(SharedMsg("earlier", "first", 10, false)),
+        )
+        assertEquals(listOf("earlier", "later"), ordered.map { it.id })
     }
 
     @Test

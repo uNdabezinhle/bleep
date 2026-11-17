@@ -116,15 +116,20 @@ class Session(private val relay: Relay) {
     val blocked = mutableSetOf<String>()
     var webPocket: JSONObject? = null
     var webPocketKnown: Boolean = false
+    var sharedSessions: JSONObject? = null
+    private var sessionDirty = false
     var lastDetail: String = ""
     var captureNotice: Boolean = false
     var regionOk: Boolean = true
     var guardianMode: String = "warn"
     var autoLockSec: Int = 60
+    var listenBackground: Boolean = false
+    private val ioLock = Any()
     var shortId: String? = null
     var handle: String? = null
     private var liftedIds = false
     private var lastHistoryJson: String? = null
+    private val openedIds = mutableSetOf<String>()
 
     fun create(displayName: String) {
         id = Crypto.generateIdentity(displayName)
@@ -264,9 +269,11 @@ class Session(private val relay: Relay) {
         .put("blocked", org.json.JSONArray(blocked.toList()))
         .put("webPocketKnown", webPocketKnown)
         .put("webPocket", webPocket ?: JSONObject.NULL)
+        .put("sharedSessions", sharedSessions ?: JSONObject.NULL)
         .put("captureNotice", captureNotice)
         .put("guardianMode", guardianMode)
         .put("autoLockSec", autoLockSec)
+        .put("listenBackground", listenBackground)
         .put("shortId", shortId ?: JSONObject.NULL)
         .put("handle", handle ?: JSONObject.NULL)
         .put("avatarId", avatarId ?: JSONObject.NULL)
@@ -306,11 +313,13 @@ class Session(private val relay: Relay) {
         captureNotice = snap.optBoolean("captureNotice", false)
         guardianMode = snap.optString("guardianMode", "warn").ifBlank { "warn" }
         autoLockSec = snap.optInt("autoLockSec", 60)
+        listenBackground = snap.optBoolean("listenBackground", false)
         shortId = snap.optString("shortId").ifBlank { null }
         handle = snap.optString("handle").ifBlank { null }
         avatarId = if (snap.isNull("avatarId")) null else snap.optString("avatarId").ifBlank { "" }
         avatarB64 = if (snap.isNull("avatarB64")) null else snap.optString("avatarB64").ifBlank { null }
         webPocket = if (snap.isNull("webPocket")) null else snap.optJSONObject("webPocket")
+        sharedSessions = if (snap.isNull("sharedSessions")) null else snap.optJSONObject("sharedSessions")
         loadLists(snap)
         val ch = relay.challenge()
         val sig = Crypto.sign(id.edSk, Crypto.authMessage(id.mailboxId, ch.getString("nonce")))
@@ -498,6 +507,7 @@ class Session(private val relay: Relay) {
 
     fun sendText(peer: Peer, text: String, replyTo: String? = null, replyText: String? = null, viewOnce: Boolean = false) {
         if (peer.safetyChanged) error("Safety number changed. This is a new key. Verify it before you send.")
+        beginSend(peer)
         ensureAlice(peer)
         val st = ratchets[peer.mailboxId]!!
         val exp = peer.disappearSec?.let { System.currentTimeMillis() + it * 1000L }
@@ -524,6 +534,7 @@ class Session(private val relay: Relay) {
         enqueueDrop(peer.mailboxId, Bytes.b64e(blob))
         val list = threads.getOrPut(peer.mailboxId) { mutableListOf() }
         list += ChatMsg(payload.getString("id"), true, text, System.currentTimeMillis(), peer.mailboxId, expiresAt = exp, replyTo = replyTo, replyText = replyText, viewOnce = viewOnce)
+        finishSend(peer.mailboxId)
     }
 
     fun sendReact(peer: Peer, targetId: String, emoji: String = "👍") {
@@ -611,6 +622,7 @@ class Session(private val relay: Relay) {
     }
 
     private fun sendPayload(peer: Peer, payload: JSONObject, intro: Boolean, ttlSeconds: Int? = null) {
+        beginSend(peer)
         ensureAlice(peer)
         val st = ratchets[peer.mailboxId]!!
         val (header, ct) = Ratchet.encrypt(st, Bytes.utf8(payload.toString()))
@@ -628,6 +640,7 @@ class Session(private val relay: Relay) {
         if (isPk) pendingPq.remove(peer.mailboxId)?.let { unsigned.put("pq", Bytes.b64e(it)) }
         unsigned.put("sig", Bytes.b64e(Crypto.sign(id.edSk, Bytes.utf8(Canonical.of(unsigned)))))
         enqueueDrop(peer.mailboxId, Bytes.b64e(Seal.outer(peer.xPk, Bytes.utf8(unsigned.toString()))), ttlSeconds)
+        finishSend(peer.mailboxId)
     }
 
     private fun enqueueDrop(dest: String, blobB64: String, ttlSeconds: Int? = null) {
@@ -655,16 +668,41 @@ class Session(private val relay: Relay) {
     }
 
     fun poll() {
+        synchronized(ioLock) {
         lastIngest = 0
         liftShortIds()
         flushOutbox()
         val items = relay.fetch(token)
+        val ack = org.json.JSONArray()
         for (i in 0 until items.length()) {
-            val blob = items.getJSONObject(i).getString("blob_b64")
-            ingest(blob)
+            val row = items.getJSONObject(i)
+            val eid = row.optString("id")
+            val opened = if (eid.isNotBlank() && eid in openedIds) true
+            else try {
+                ingest(row.getString("blob_b64"))
+            } catch (_: Exception) {
+                false
+            }
+            if (opened && eid.isNotBlank()) {
+                openedIds += eid
+                ack.put(eid)
+            }
+        }
+        if (ack.length() > 0) {
+            try {
+                relay.ack(token, ack)
+                for (i in 0 until ack.length()) openedIds.remove(ack.getString(i))
+            } catch (_: Exception) { }
         }
         sweep()
         refreshPresence()
+        if (sessionDirty) {
+            sessionDirty = false
+            try {
+                pushHistory(force = true)
+            } catch (_: Exception) { }
+        }
+        }
     }
 
     private fun refreshPresence() {
@@ -707,15 +745,34 @@ class Session(private val relay: Relay) {
         body.put("mlkem_sig_b64", Bytes.b64e(Crypto.sign(ident.edSk, Bytes.concat(Bytes.utf8("BLEEP-MLKEM-v1|"), pub))))
     }
 
-    private fun ingest(blobB64: String) {
+    private fun alreadyHave(messageId: String): Boolean {
+        if (messageId.isBlank()) return false
+        if (requests.any { it.id == messageId }) return true
+        if (statuses.any { it.id == messageId }) return true
+        if (threads.values.any { list -> list.any { it.id == messageId } }) return true
+        if (groupThreads.values.any { list -> list.any { it.id == messageId } }) return true
+        if (chamberThreads.values.any { list -> list.any { it.id == messageId } }) return true
+        return false
+    }
+
+    private fun ingest(blobB64: String): Boolean {
         val innerBytes = try {
             Seal.openOuter(id.xSk, Bytes.b64d(blobB64))
         } catch (_: Exception) {
-            return
+            return false
         }
-        val inner = JSONObject(Bytes.fromUtf8(innerBytes))
-        val rest = JSONObject(inner.toString()).apply { remove("sig") }
-        if (!Crypto.verify(Bytes.b64d(inner.getString("sid")), Bytes.utf8(Canonical.of(rest)), Bytes.b64d(inner.getString("sig")))) return
+        val inner = try {
+            JSONObject(Bytes.fromUtf8(innerBytes))
+        } catch (_: Exception) {
+            return false
+        }
+        val signed = try {
+            val rest = JSONObject(inner.toString()).apply { remove("sig") }
+            Crypto.verify(Bytes.b64d(inner.getString("sid")), Bytes.utf8(Canonical.of(rest)), Bytes.b64d(inner.getString("sig")))
+        } catch (_: Exception) {
+            return false
+        }
+        if (!signed) return true
         val mid = inner.getString("mid")
         val fromEd = Bytes.b64d(inner.getString("sid"))
         val fromX = Bytes.b64d(inner.getString("spk"))
@@ -726,28 +783,38 @@ class Session(private val relay: Relay) {
             }
         }
         var st = ratchets[mid]
+        val created = st == null
         if (st == null) {
-            if (!inner.has("ek")) return
+            val kind = inner.optString("t")
+            if (kind != "pkmsg" && kind != "intro") return false
+            if (!inner.has("ek")) return false
             var sk = Ratchet.x3dhBob(id.xSk, spk.sk, fromX, Bytes.b64d(inner.getString("ek")), null)
             val pq = inner.optString("pq")
             if (pq.isNotBlank()) {
-                if (id.pqSeed.size != 64) return
+                if (id.pqSeed.size != 64) return false
                 sk = try {
                     Ratchet.hybridRoot(sk, Crypto.pqDecaps(Bytes.b64d(pq), id.pqSeed))
                 } catch (_: Exception) {
-                    return
+                    return false
                 }
             }
             st = Ratchet.initBob(sk, spk.sk, spk.pk)
-            ratchets[mid] = st
         }
         val h = inner.getJSONObject("h")
         val header = Header(h.getString("dh"), h.getInt("n"), h.getInt("pn"))
-        val pt = JSONObject(Bytes.fromUtf8(Ratchet.decrypt(st, header, Bytes.b64d(inner.getString("ct")))))
+        val state = st ?: return false
+        val pt = try {
+            JSONObject(Bytes.fromUtf8(Ratchet.decrypt(state, header, Bytes.b64d(inner.getString("ct")))))
+        } catch (_: Exception) {
+            return false
+        }
+        if (created) ratchets[mid] = state
+        publishSession(mid)
+        sessionDirty = true
         val kind = pt.optString("kind")
         if (kind == "ctrl" && pt.optString("op") == "screen-capture") {
-            val peer = peers[mid] ?: return
-            if (!peer.accepted) return
+            val peer = peers[mid] ?: return true
+            if (!peer.accepted) return true
             threads.getOrPut(mid) { mutableListOf() } += ChatMsg(
                 pt.optString("id").ifBlank { java.util.UUID.randomUUID().toString() },
                 false,
@@ -757,7 +824,7 @@ class Session(private val relay: Relay) {
                 kind = "system",
             )
             lastIngest++
-            return
+            return true
         }
         if (kind == "ctrl" && pt.optString("op") == "status") {
             val data = pt.optJSONObject("data") ?: JSONObject()
@@ -779,7 +846,7 @@ class Session(private val relay: Relay) {
             )
             if (statuses.none { it.id == item.id }) statuses.add(0, item)
             lastIngest++
-            return
+            return true
         }
         if (kind == "ctrl" && pt.optString("op") == "profile") {
             val data = pt.optJSONObject("data") ?: JSONObject()
@@ -795,7 +862,27 @@ class Session(private val relay: Relay) {
                 peer.avatarB64 = raw
             }
             lastIngest++
-            return
+            return true
+        }
+        if (kind == "ctrl" && pt.optString("op") == "leave-group") {
+            val gid = pt.optJSONObject("data")?.optString("groupId").orEmpty()
+            val group = groups[gid]
+            if (group != null) {
+                val next = GroupOps.applyLeave(group.members, group.version, mid)
+                if (next != null) {
+                    groups[gid] = group.copy(members = next.first, version = next.second)
+                    groupThreads.getOrPut("g:$gid") { mutableListOf() } += ChatMsg(
+                        pt.optString("id").ifBlank { java.util.UUID.randomUUID().toString() },
+                        false,
+                        "They left.",
+                        System.currentTimeMillis(),
+                        mid,
+                        kind = "system",
+                    )
+                }
+            }
+            lastIngest++
+            return true
         }
         if (kind == "react") {
             val target = pt.optString("target")
@@ -807,7 +894,7 @@ class Session(private val relay: Relay) {
             }
             mark(threads[mid])
             groupThreads.values.forEach { mark(it) }
-            return
+            return true
         }
         val text = pt.optString("text")
         val peer = peers.getOrPut(mid) {
@@ -839,6 +926,7 @@ class Session(private val relay: Relay) {
             chamberInvite = pt.optBoolean("chamber"),
             burnAt = if (pt.has("burnAt") && !pt.isNull("burnAt")) pt.optLong("burnAt") else null,
         )
+        if (msg.id.isNotBlank() && alreadyHave(msg.id)) return true
         val holdIntro = kind == "intro" && (!peer.accepted || groupInvite != null || msg.chamberInvite)
         if (holdIntro || !peer.accepted) {
             requests += msg
@@ -855,24 +943,24 @@ class Session(private val relay: Relay) {
                     }
                 }
             }
-            return
+            return true
         }
         if (!groupInvite.isNullOrBlank() && groups.containsKey(groupInvite)) {
             groupThreads.getOrPut("g:$groupInvite") { mutableListOf() } += msg
             lastIngest++
-            return
+            return true
         }
         if (!groupInvite.isNullOrBlank()) {
             requests += msg
             lastIngest++
-            return
+            return true
         }
         if (pt.optBoolean("chamber") && kind != "intro") {
             val chamber = chambers.values.find { it.peerMailboxId == mid || it.id == mid }
             if (chamber != null) chamberThreads.getOrPut("ch:${chamber.id}") { mutableListOf() } += msg
             else requests += msg.copy(chamberInvite = true)
             lastIngest++
-            return
+            return true
         }
         threads.getOrPut(mid) { mutableListOf() } += msg
         if (guardianMode != "off") {
@@ -893,6 +981,7 @@ class Session(private val relay: Relay) {
             }
         }
         lastIngest++
+        return true
     }
 
     fun verifyPeer(peer: Peer) {
@@ -997,7 +1086,7 @@ class Session(private val relay: Relay) {
         lastHistoryJson = historyView().toString()
     }
 
-    fun pushHistory() {
+    fun pushHistory(force: Boolean = false, rethrowConflict: Boolean = false) {
         val seedB64 = recoverySeed ?: return
         if (!ready) return
         try {
@@ -1006,7 +1095,7 @@ class Session(private val relay: Relay) {
             pushChambers()
             val remote = relay.history(token)
             val text = historyView().toString()
-            if (text == lastHistoryJson) return
+            if (!force && text == lastHistoryJson) return
             val gen = maxOf(historyGeneration, remote.optInt("generation", 0)) + 1
             val nonce = Bytes.random(12)
             val ct = Crypto.aeadEncrypt(Crypto.historyKey(Bytes.b64d(seedB64)), nonce, text.toByteArray(Charsets.UTF_8))
@@ -1015,7 +1104,12 @@ class Session(private val relay: Relay) {
             lastHistoryJson = text
         } catch (e: Exception) {
             if (e.message?.contains("erase") == true) throw Erased()
-            if (e.message?.contains("409") == true) pullHistory()
+            if (e.message?.contains("409") == true) {
+                if (rethrowConflict) throw e
+                pullHistory()
+            } else if (rethrowConflict) {
+                throw e
+            }
         }
     }
 
@@ -1040,6 +1134,7 @@ class Session(private val relay: Relay) {
     private fun historyView(): JSONObject {
         val peersJ = JSONObject()
         peers.forEach { (k, p) ->
+            if (p.edPk.none { it != 0.toByte() } || p.xPk.none { it != 0.toByte() }) return@forEach
             peersJ.put(
                 k,
                 JSONObject()
@@ -1069,27 +1164,10 @@ class Session(private val relay: Relay) {
                     .put("lastPreview", last?.text ?: "")
                     .put("lastAt", last?.at ?: 0L),
             )
+            val disappear = peers[peerId]?.disappearSec
+            if (disappear != null) threadsJ.getJSONObject(threadId).put("disappearingSec", disappear)
             val arr = org.json.JSONArray()
-            list.forEach { m ->
-                arr.put(
-                    JSONObject()
-                        .put("id", m.id)
-                        .put("threadId", threadId)
-                        .put("fromMe", m.fromMe)
-                        .put("text", m.text)
-                        .put("at", m.at)
-                        .put("kind", m.kind)
-                        .put("mime", m.mime ?: JSONObject.NULL)
-                        .put("name", m.name ?: JSONObject.NULL)
-                        .put("attachmentId", m.fileId ?: JSONObject.NULL)
-                        .put("peerId", peerId)
-                        .put("viewOnce", m.viewOnce)
-                        .put("viewed", m.viewed)
-                        .put("deleted", m.deleted)
-                        .put("replyTo", m.replyTo ?: JSONObject.NULL)
-                        .put("replyText", m.replyText ?: JSONObject.NULL),
-                )
-            }
+            list.forEach { m -> arr.put(sharedMessageJson(m, threadId, peerId)) }
             messagesJ.put(threadId, arr)
         }
         groups.forEach { (gid, g) ->
@@ -1107,25 +1185,7 @@ class Session(private val relay: Relay) {
                     .put("lastAt", last?.at ?: 0L),
             )
             val arr = org.json.JSONArray()
-            list.forEach { m ->
-                arr.put(
-                    JSONObject()
-                        .put("id", m.id)
-                        .put("threadId", threadId)
-                        .put("fromMe", m.fromMe)
-                        .put("text", m.text)
-                        .put("at", m.at)
-                        .put("kind", m.kind)
-                        .put("mime", m.mime ?: JSONObject.NULL)
-                        .put("name", m.name ?: JSONObject.NULL)
-                        .put("attachmentId", m.fileId ?: JSONObject.NULL)
-                        .put("viewOnce", m.viewOnce)
-                        .put("viewed", m.viewed)
-                        .put("deleted", m.deleted)
-                        .put("replyTo", m.replyTo ?: JSONObject.NULL)
-                        .put("replyText", m.replyText ?: JSONObject.NULL),
-                )
-            }
+            list.forEach { m -> arr.put(sharedMessageJson(m, threadId, "")) }
             messagesJ.put(threadId, arr)
         }
         val req = org.json.JSONArray()
@@ -1152,10 +1212,31 @@ class Session(private val relay: Relay) {
             .put("messages", messagesJ)
             .put("requests", req)
             .put("blocked", org.json.JSONArray(blocked.toList()))
+            .put("sessions", sharedSessions ?: JSONObject())
             .put("android", androidPocket())
         if (webPocketKnown) view.put("web", webOverlay())
         return view
     }
+
+    private fun sharedMessageJson(m: ChatMsg, threadId: String, other: String) = JSONObject()
+        .put("id", m.id)
+        .put("threadId", threadId)
+        .put("fromMe", m.fromMe)
+        .put("text", m.text)
+        .put("at", m.at)
+        .put("kind", m.kind)
+        .put("mime", m.mime ?: JSONObject.NULL)
+        .put("name", m.name ?: JSONObject.NULL)
+        .put("attachmentId", m.fileId ?: JSONObject.NULL)
+        .put("fromMailbox", if (m.fromMe) id.mailboxId else m.peerId.ifBlank { other })
+        .put("peerId", m.peerId.ifBlank { other })
+        .put("viewOnce", m.viewOnce)
+        .put("viewed", m.viewed)
+        .put("deleted", m.deleted)
+        .put("replyTo", m.replyTo ?: JSONObject.NULL)
+        .put("replyText", m.replyText ?: JSONObject.NULL)
+        .put("expiresAt", m.expiresAt ?: JSONObject.NULL)
+        .put("reacted", m.reacted ?: JSONObject.NULL)
 
     private fun webOverlay(): JSONObject {
         val web = if (webPocket == null) JSONObject() else JSONObject(webPocket.toString())
@@ -1190,10 +1271,6 @@ class Session(private val relay: Relay) {
         if (pocket.has("spkSk") && pocket.has("spkPk")) {
             spk = XPair(Bytes.b64d(pocket.getString("spkSk")), Bytes.b64d(pocket.getString("spkPk")))
         }
-        pocket.optJSONObject("ratchets")?.let { rats ->
-            ratchets.clear()
-            rats.keys().forEach { k -> ratchets[k] = Ratchet.load(rats.getJSONObject(k)) }
-        }
         pocket.optJSONArray("opks")?.let { arr ->
             opks.clear()
             for (i in 0 until arr.length()) {
@@ -1210,10 +1287,12 @@ class Session(private val relay: Relay) {
     private fun applyShared(view: JSONObject) {
         if (view.optString("kind") == "android") {
             if (view.has("displayName")) id = id.copy(displayName = view.getString("displayName"))
+            rememberShared(view)
             loadLists(view)
             return
         }
         if (view.has("displayName")) id = id.copy(displayName = view.getString("displayName"))
+        rememberShared(view)
         view.optJSONObject("web")?.let { web ->
             importGroups(web.optJSONObject("groups"), replace = false)
             importStatuses(web.optJSONArray("statuses"))
@@ -1232,10 +1311,12 @@ class Session(private val relay: Relay) {
                 val prev = peers[k]
                 val name = o.optString("displayName").ifBlank { prev?.displayName ?: k.take(6) }
                 val nextAvatar = if (o.has("avatarId") && !o.isNull("avatarId")) o.optString("avatarId") else prev?.avatarId
+                val edRaw = o.optString("edPk")
+                val xRaw = o.optString("xPk")
                 peers[k] = Peer(
                     o.optString("mailboxId", k),
-                    if (o.has("edPk")) Bytes.b64d(o.getString("edPk")) else prev?.edPk ?: ByteArray(32),
-                    if (o.has("xPk")) Bytes.b64d(o.getString("xPk")) else prev?.xPk ?: ByteArray(32),
+                    if (edRaw.isNotBlank()) Bytes.b64d(edRaw) else prev?.edPk ?: ByteArray(32),
+                    if (xRaw.isNotBlank()) Bytes.b64d(xRaw) else prev?.xPk ?: ByteArray(32),
                     name,
                     (prev?.accepted == true) || o.optBoolean("accepted"),
                     (prev?.verified == true) || o.optBoolean("verified"),
@@ -1259,28 +1340,42 @@ class Session(private val relay: Relay) {
             threadMeta.keys().forEach { tid ->
                 val meta = threadMeta.optJSONObject(tid)
                 val asArray = threadMeta.optJSONArray(tid)
-                val peerId = when {
-                    meta != null -> meta.optString("peerMailboxId")
-                    asArray != null -> tid
-                    else -> ""
-                }
                 if (tid.startsWith("ch:") || meta?.optString("kind") == "chamber") return@forEach
                 if (tid.startsWith("g:") || meta?.optString("kind") == "group") {
                     val gid = meta?.optString("groupId").orEmpty().ifBlank { tid.removePrefix("g:") }
-                    if (groups[gid] == null) {
-                        groups[gid] = GroupState(gid, meta?.optString("title").orEmpty().ifBlank { "Group" }, emptyList(), 1)
-                    }
+                    val title = meta?.optString("title").orEmpty().ifBlank { "Group" }
+                    val prevGroup = groups[gid]
+                    if (prevGroup == null) groups[gid] = GroupState(gid, title, emptyList(), 1)
+                    else if (title != "Group" && prevGroup.name == "Group") groups[gid] = prevGroup.copy(name = title)
                     val incomingGroup = messageMap?.optJSONArray(tid) ?: org.json.JSONArray()
                     mergeBucket(groupThreads, "g:$gid", incomingGroup, gid)
                     return@forEach
                 }
-                if (peerId.isBlank()) return@forEach
+                val peerId = when {
+                    meta != null && meta.optString("peerMailboxId").isNotBlank() -> meta.optString("peerMailboxId")
+                    peerFromDm(tid, mine) != null -> peerFromDm(tid, mine)!!
+                    asArray != null && tid.isNotBlank() -> tid
+                    else -> ""
+                }
+                if (peerId.isBlank() || peerId == mine) return@forEach
                 val incoming = when {
                     messageMap?.optJSONArray(tid) != null -> messageMap.getJSONArray(tid)
                     asArray != null -> asArray
                     else -> org.json.JSONArray()
                 }
                 mergeBucket(threads, peerId, incoming, peerId)
+                val title = meta?.optString("title").orEmpty().ifBlank { peerId.take(6) }
+                val prev = peers[peerId]
+                if (prev == null) {
+                    peers[peerId] = Peer(peerId, ByteArray(32), ByteArray(32), title, accepted = true)
+                } else if (!prev.blocked) {
+                    prev.accepted = true
+                    if (prev.displayName.isBlank()) prev.displayName = title
+                }
+                if (meta != null && meta.has("disappearingSec") && !meta.isNull("disappearingSec")) {
+                    val sec = meta.optInt("disappearingSec")
+                    if (sec > 0) peers[peerId]?.disappearSec = sec
+                }
             }
         }
         view.optJSONArray("requests")?.let { arr ->
@@ -1366,7 +1461,10 @@ class Session(private val relay: Relay) {
         val local = bucket.getOrPut(key) { mutableListOf() }
         val merged = mergeSharedMessages(
             local.map {
-                SharedMsg(it.id, it.text, it.at, it.fromMe, it.fileId, it.kind, it.viewOnce, it.replyTo, it.replyText, it.mime, it.name, it.deleted)
+                SharedMsg(
+                    it.id, it.text, it.at, it.fromMe, it.fileId, it.kind, it.viewOnce, it.replyTo, it.replyText,
+                    it.mime, it.name, it.deleted, it.expiresAt, it.reacted, it.peerId.ifBlank { null },
+                )
             },
             List(incoming.length()) { i ->
                 val o = incoming.getJSONObject(i)
@@ -1384,6 +1482,9 @@ class Session(private val relay: Relay) {
                     o.optString("mime").ifBlank { null },
                     o.optString("name").ifBlank { null },
                     o.optBoolean("deleted"),
+                    if (o.has("expiresAt") && !o.isNull("expiresAt")) o.optLong("expiresAt") else null,
+                    o.optString("reacted").ifBlank { null },
+                    o.optString("fromMailbox").ifBlank { o.optString("peerId").ifBlank { null } },
                 )
             },
         )
@@ -1401,6 +1502,9 @@ class Session(private val relay: Relay) {
                     name = sm.name ?: prev.name,
                     fileId = sm.attachmentId ?: prev.fileId,
                     kind = if (sm.kind.isBlank()) prev.kind else sm.kind,
+                    expiresAt = sm.expiresAt ?: prev.expiresAt,
+                    reacted = sm.reacted ?: prev.reacted,
+                    peerId = if (key.startsWith("g:")) sm.fromMailbox ?: prev.peerId else prev.peerId.ifBlank { peerId },
                 )
             } else {
                 ChatMsg(
@@ -1408,15 +1512,18 @@ class Session(private val relay: Relay) {
                     sm.fromMe,
                     if (sm.deleted) "" else sm.text,
                     sm.at,
-                    peerId,
-                    sm.kind,
+                    if (key.startsWith("g:")) sm.fromMailbox.orEmpty() else peerId,
+                    sm.kind.ifBlank { "text" },
                     sm.mime,
                     fileId = sm.attachmentId,
+                    reacted = sm.reacted,
+                    expiresAt = sm.expiresAt,
                     name = sm.name,
                     replyTo = sm.replyTo,
                     replyText = sm.replyText,
                     viewOnce = sm.viewOnce,
                     deleted = sm.deleted,
+                    groupId = if (key.startsWith("g:")) key.removePrefix("g:") else null,
                 )
             }
         }.toMutableList()
@@ -1677,6 +1784,26 @@ class Session(private val relay: Relay) {
         requests.removeAll { it.groupId == groupId }
         groupThreads.getOrPut("g:$groupId") { mutableListOf() }.addAll(held)
         shareProfileWith(peer)
+    }
+
+    fun leaveGroup(groupId: String) {
+        val group = groups[groupId] ?: return
+        group.members.forEach { member ->
+            if (member.mailboxId == id.mailboxId) return@forEach
+            val peer = peers[member.mailboxId] ?: return@forEach
+            if (peer.xPk.size != 32 || peer.xPk.all { it == 0.toByte() }) return@forEach
+            sendPayload(
+                peer,
+                JSONObject()
+                    .put("kind", "ctrl")
+                    .put("id", java.util.UUID.randomUUID().toString())
+                    .put("op", "leave-group")
+                    .put("data", JSONObject().put("groupId", groupId)),
+                intro = false,
+            )
+        }
+        groups.remove(groupId)
+        groupThreads.remove("g:$groupId")
     }
 
     fun startChamber(peer: Peer, days: Int = 7): String {
@@ -2029,6 +2156,89 @@ class Session(private val relay: Relay) {
     private fun groupDestinations(groupId: String): List<Peer> {
         val g = groups[groupId] ?: return emptyList()
         return g.members.mapNotNull { m -> if (m.mailboxId == id.mailboxId) null else peers[m.mailboxId] }
+    }
+
+    private fun beginSend(peer: Peer) {
+        if (peer.xPk.size != 32 || peer.xPk.all { it == 0.toByte() }) {
+            error("This chat is on this phone, but the key has not arrived yet.")
+        }
+        synchronized(ioLock) {
+            for (attempt in 0..1) {
+                try {
+                    pullHistory()
+                } catch (e: Exception) {
+                    if (e is Erased) throw e
+                }
+                adoptShared(peer.mailboxId)
+                try {
+                    pushHistory(force = true, rethrowConflict = true)
+                    return
+                } catch (e: Exception) {
+                    if (e is Erased) throw e
+                    if (e.message?.contains("409") == true) {
+                        if (attempt == 1) error("This chat is open on the other device. Wait, then send again.")
+                        continue
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    private fun finishSend(peerId: String) {
+        synchronized(ioLock) {
+            publishSession(peerId)
+            sessionDirty = false
+            try {
+                pushHistory(force = true, rethrowConflict = true)
+            } catch (e: Exception) {
+                if (e is Erased) throw e
+                if (e.message?.contains("409") == true) {
+                    try {
+                        pullHistory()
+                    } catch (err: Exception) {
+                        if (err is Erased) throw err
+                    }
+                }
+            }
+        }
+    }
+
+    private fun adoptShared(peerId: String) {
+        val dumped = sharedSessions?.optJSONObject(peerId) ?: return
+        if (!dumped.has("dhsSk")) return
+        ratchets[peerId] = Ratchet.load(dumped)
+        pendingPk.remove(peerId)
+        ephPk.remove(peerId)
+        pendingPq.remove(peerId)
+    }
+
+    private fun publishSession(peerId: String) {
+        val st = ratchets[peerId] ?: return
+        if (sharedSessions == null) sharedSessions = JSONObject()
+        sharedSessions!!.put(peerId, Ratchet.dump(st))
+    }
+
+    private fun rememberShared(view: JSONObject) {
+        if (sharedSessions == null) sharedSessions = JSONObject()
+        val dest = sharedSessions!!
+        fun putDump(id: String, row: JSONObject?) {
+            if (row != null && row.has("dhsSk")) dest.put(id, row)
+        }
+        view.optJSONObject("sessions")?.let { top ->
+            top.keys().forEach { k -> putDump(k, top.optJSONObject(k)) }
+        }
+        view.optJSONObject("android")?.optJSONObject("ratchets")?.let { rats ->
+            rats.keys().forEach { k -> if (!dest.has(k)) putDump(k, rats.optJSONObject(k)) }
+        }
+        view.optJSONObject("ratchets")?.let { rats ->
+            rats.keys().forEach { k -> if (!dest.has(k)) putDump(k, rats.optJSONObject(k)) }
+        }
+        view.optJSONObject("web")?.optJSONObject("sessions")?.let { sessions ->
+            sessions.keys().forEach { k ->
+                if (!dest.has(k)) putDump(k, sessions.optJSONObject(k)?.optJSONObject("ratchet"))
+            }
+        }
     }
 
     private fun ensureAlice(peer: Peer) {

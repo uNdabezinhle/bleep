@@ -51,6 +51,19 @@ class ChannelPost(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class PushSub(Base):
+    """Browser push subscription. The wake body is fixed and has no message text."""
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    mailbox_id: Mapped[str] = mapped_column(String(64), index=True)
+    endpoint: Mapped[str] = mapped_column(String(2000), unique=True)
+    p256dh: Mapped[str] = mapped_column(String(200))
+    auth: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Account(Base):
     """Login record. Identity private keys never live here."""
 

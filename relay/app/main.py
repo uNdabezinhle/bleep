@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,9 +23,11 @@ from .crypto import auth_message, registration_message, verify_ed25519
 from .db import Base, SessionLocal, engine, get_session
 from .accounts import guard_device, router as account_router
 from .channels import router as channel_router
+from . import push
 from .models import Account, DemandLog, Device, Envelope, HistoryBlob, HistoryExtra, HistoryFile, Mailbox, OneTimePrekey
 from .rate import check_drop, check_handle, check_prekey
 from .schemas import (
+    AckIn,
     AuthIn,
     ChallengeOut,
     DropIn,
@@ -103,6 +105,7 @@ app = FastAPI(
 )
 app.include_router(account_router)
 app.include_router(channel_router)
+app.include_router(push.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -128,7 +131,7 @@ async def health(_region: str = Depends(require_region)):
         region=settings.bleep_region,
         fail_closed=True,
         env=settings.bleep_env,
-        holdings="sealed envelopes with TTL; sealed history blob; sealed file bytes; sealed extra blobs; email and password verifier; public channel posts are plaintext; precise last_seen; no sender column on envelopes",
+        holdings="sealed envelopes with TTL; sealed history blob; sealed file bytes; sealed extra blobs; email and password verifier; public channel posts are plaintext; precise last_seen; wake-only push subscription; no sender column on envelopes",
     )
 
 
@@ -394,6 +397,7 @@ async def drop_mail(
     session.add(env)
     await session.commit()
     await wake.ping(dest.id)
+    await push.notify(dest.id, session)
     # principal.mailbox_id deliberately not written on Envelope (T7).
     return DropOut(id=env.id, expires_at=env.expires_at.isoformat())
 
@@ -421,15 +425,41 @@ async def fetch_mail(
         EnvelopeOut(id=r.id, blob_b64=b64e(r.blob), expires_at=r.expires_at.isoformat())
         for r in rows
     ]
-    freed = 0
-    for r in rows:
-        freed += r.size_bytes
-        await session.delete(r)
-    box.bytes_in_flight = max(0, box.bytes_in_flight - freed)
     box.last_connect_band = hour_band()
     box.last_seen = now
     await session.commit()
     return out
+
+
+@app.post("/v1/mail/ack", status_code=204)
+async def ack_mail(
+    body: AckIn,
+    principal: Principal = Depends(require_mailbox),
+    session: AsyncSession = Depends(get_session),
+    _region: str = Depends(require_region),
+):
+    """Delete envelopes this mailbox has opened. Unknown ids are ignored. No sender column."""
+    await guard_device(principal, session)
+    ids = [i for i in body.ids if i][:50]
+    if not ids:
+        return Response(status_code=204)
+    rows = (
+        await session.execute(
+            select(Envelope).where(
+                Envelope.dest_mailbox_id == principal.mailbox_id,
+                Envelope.id.in_(ids),
+            )
+        )
+    ).scalars().all()
+    box = await session.get(Mailbox, principal.mailbox_id)
+    freed = 0
+    for row in rows:
+        freed += row.size_bytes
+        await session.delete(row)
+    if box:
+        box.bytes_in_flight = max(0, (box.bytes_in_flight or 0) - freed)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @app.get("/v1/presence")
@@ -565,6 +595,7 @@ async def ops_schema(authorization: str | None = Header(default=None)):
             ],
             "channels": ["id", "name", "created_at", "owner_mailbox"],
             "channel_posts": ["id", "channel_id", "author_mailbox", "author_name", "body plaintext", "created_at"],
+            "push_subscriptions": ["id", "mailbox_id", "endpoint", "p256dh", "auth", "created_at"],
             "one_time_prekeys": ["mailbox_id", "key_id", "pub"],
             "envelopes": [
                 "id",
@@ -577,7 +608,7 @@ async def ops_schema(authorization: str | None = Header(default=None)):
             ],
             "demand_log": ["at", "mailbox_id", "kind", "note"],
         },
-        "held_plaintext": ["public channel posts", "precise last_seen timestamp"],
+        "held_plaintext": ["public channel posts", "precise last_seen timestamp", "push subscription endpoint"],
         "not_held": [
             "message plaintext",
             "attachment plaintext",

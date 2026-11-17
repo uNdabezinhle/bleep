@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_pass: str = ""
     smtp_from: str = ""
+    bleep_vapid_public: str = ""
+    bleep_vapid_private: str = ""
+    bleep_vapid_sub: str = "mailto:hello@bleep.de5.net"
 
 
 settings = Settings()
