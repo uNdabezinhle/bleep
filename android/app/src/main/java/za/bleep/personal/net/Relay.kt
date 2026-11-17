@@ -24,10 +24,11 @@ class Relay(var base: String = "http://10.0.2.2:8090") {
         if (token != null) put("Authorization", "Bearer $token")
     }
 
-    fun req(method: String, path: String, body: JSONObject? = null, token: String? = null): JSONObject {
+    fun req(method: String, path: String, body: JSONObject? = null, token: String? = null, extra: Map<String, String> = emptyMap()): JSONObject {
         val b = body?.toString()?.toRequestBody(jsonType)
         val rb = Request.Builder().url(base.trimEnd('/') + path)
         headers(token).forEach { (k, v) -> rb.addHeader(k, v) }
+        extra.forEach { (k, v) -> rb.addHeader(k, v) }
         when (method) {
             "GET" -> rb.get()
             "POST" -> rb.post(b ?: "{}".toRequestBody(jsonType))
@@ -66,7 +67,7 @@ class Relay(var base: String = "http://10.0.2.2:8090") {
     fun postChannel(token: String, id: String, text: String, name: String): JSONObject =
         req("POST", "/v1/channels/$id/posts", JSONObject().put("text", text).put("name", name), token)
     fun fetch(token: String): JSONArray {
-        val r = req("GET", "/v1/mail", token = token)
+        val r = req("GET", "/v1/mail", token = token, extra = mapOf("X-Bleep-Retain" to "1"))
         return r.optJSONArray("items") ?: JSONArray()
     }
 

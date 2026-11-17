@@ -37,7 +37,10 @@ A device-only mailbox (no account) still uses a random mailbox id and random
 keys. The mailbox routing ID is not the identity public key. Remote unlink
 marks the mailbox dead and the client registers a new routing ID (T13).
 
-`GET /v1/mail` returns sealed envelopes and does not delete them.
+`GET /v1/mail` returns sealed envelopes. A current client sends
+`X-Bleep-Retain: 1`, and that fetch does not delete the rows. A fetch
+without the header still deletes the rows it returned, so an older app
+keeps working.
 `POST /v1/mail/ack` deletes ids for that mailbox only. A client acks an
 envelope after the signature checks and the ratchet opens. If the ratchet
 does not open, the envelope stays until a device that can open it acks it,

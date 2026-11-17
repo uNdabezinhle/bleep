@@ -131,12 +131,15 @@ def test_fetch_is_opaque_blob():
             json={"dest_mailbox_id": b["mailbox_id"], "blob_b64": blob},
             headers={**HDR, "Authorization": f"Bearer {a['token']}"},
         )
-        got = c.get("/v1/mail", headers={**HDR, "Authorization": f"Bearer {b['token']}"})
+        auth_b = {**HDR, "Authorization": f"Bearer {b['token']}"}
+        got = c.get("/v1/mail", headers=auth_b)
         assert got.status_code == 200
         items = got.json()
         assert len(items) == 1
         assert items[0]["blob_b64"] == blob
         assert "sender" not in items[0]
+        again = c.get("/v1/mail", headers=auth_b)
+        assert again.json() == []
 
 
 def test_fetch_keeps_blob_until_ack():
@@ -152,7 +155,7 @@ def test_fetch_keeps_blob_until_ack():
         )
         assert dropped.status_code == 202, dropped.text
         eid = dropped.json()["id"]
-        auth_b = {**HDR, "Authorization": f"Bearer {b['token']}"}
+        auth_b = {**HDR, "Authorization": f"Bearer {b['token']}", "X-Bleep-Retain": "1"}
         first = c.get("/v1/mail", headers=auth_b)
         assert first.status_code == 200
         assert len(first.json()) == 1

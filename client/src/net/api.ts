@@ -46,7 +46,8 @@ export const api = {
     req(`/v1/mailboxes/${mailboxId}/prekey`, { headers: headers(token) }),
   drop: (token: string, body: unknown) =>
     req("/v1/mail", { method: "POST", headers: headers(token), body: JSON.stringify(body) }),
-  fetch: (token: string) => req("/v1/mail", { headers: headers(token) }),
+  fetch: (token: string) =>
+    req("/v1/mail", { headers: { ...(headers(token) as Record<string, string>), "X-Bleep-Retain": "1" } }),
   ackMail: (token: string, ids: string[]) =>
     req("/v1/mail/ack", { method: "POST", headers: headers(token), body: JSON.stringify({ ids: ids.slice(0, 50) }) }),
   presence: (token: string, ids: string[]) =>

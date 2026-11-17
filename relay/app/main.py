@@ -404,6 +404,7 @@ async def drop_mail(
 
 @app.get("/v1/mail", response_model=list[EnvelopeOut])
 async def fetch_mail(
+    request: Request,
     principal: Principal = Depends(require_mailbox),
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
@@ -425,6 +426,13 @@ async def fetch_mail(
         EnvelopeOut(id=r.id, blob_b64=b64e(r.blob), expires_at=r.expires_at.isoformat())
         for r in rows
     ]
+    # An older app never acks. It still receives the blobs, and this fetch deletes them.
+    if request.headers.get("x-bleep-retain") != "1":
+        freed = 0
+        for row in rows:
+            freed += row.size_bytes or 0
+            await session.delete(row)
+        box.bytes_in_flight = max(0, (box.bytes_in_flight or 0) - freed)
     box.last_connect_band = hour_band()
     box.last_seen = now
     await session.commit()
