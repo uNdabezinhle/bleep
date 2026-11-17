@@ -47,6 +47,14 @@ export const api = {
   drop: (token: string, body: unknown) =>
     req("/v1/mail", { method: "POST", headers: headers(token), body: JSON.stringify(body) }),
   fetch: (token: string) => req("/v1/mail", { headers: headers(token) }),
+  presence: (token: string, ids: string[]) =>
+    req("/v1/presence?" + ids.slice(0, 30).map((id) => "mailbox_id=" + encodeURIComponent(id)).join("&"), { headers: headers(token) }),
+  channels: (token: string) => req("/v1/channels", { headers: headers(token) }),
+  createChannel: (token: string, name: string) =>
+    req("/v1/channels", { method: "POST", headers: headers(token), body: JSON.stringify({ name }) }),
+  channelPosts: (token: string, id: string) => req(`/v1/channels/${id}/posts`, { headers: headers(token) }),
+  postChannel: (token: string, id: string, text: string, name: string) =>
+    req(`/v1/channels/${id}/posts`, { method: "POST", headers: headers(token), body: JSON.stringify({ text, name }) }),
   unlink: (mailboxId: string, token: string) =>
     req(`/v1/mailboxes/${mailboxId}/unlink`, { method: "POST", headers: headers(token) }),
   publishHandle: (token: string, handle: string) =>

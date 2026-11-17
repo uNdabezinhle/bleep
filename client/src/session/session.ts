@@ -24,6 +24,7 @@ import {
   x3dhBob,
   type RatchetState,
 } from "../protocol/ratchet";
+import { hybridRoot, pqDecaps, pqEncaps, pqPublic } from "../protocol/pq";
 import { decodeInner, encodeInner, openOuter, sealOuter, signInner, verifyInner } from "../protocol/seal";
 import { safetyNumber } from "../protocol/safety";
 import { api } from "../net/api";
@@ -45,8 +46,19 @@ export async function registerOnRelay(id: Identity, spk: SpkHold, opks: OpkHold[
     },
     one_time_prekeys: opks.map((k) => ({ key_id: k.id, pub_b64: b64e(k.pk) })),
     registration_sig_b64: b64e(sign(id.edSk, registrationMessage(id.mailboxId, id.xPk))),
+    ...mlkemFields(id),
   };
   return api.register(body) as Promise<{ token: string; mailbox_id: string; region: string; short_id?: string }>;
+}
+
+function mlkemFields(id: Identity): { identity_mlkem_b64: string; mlkem_sig_b64: string } | Record<string, never> {
+  if (!id.pqSeed || id.pqSeed.length !== 64) return {};
+  const pub = pqPublic(id.pqSeed);
+  const prefix = new Uint8Array([..."BLEEP-MLKEM-v1|"].map((c) => c.charCodeAt(0)));
+  const msg = new Uint8Array(prefix.length + pub.length);
+  msg.set(prefix);
+  msg.set(pub, prefix.length);
+  return { identity_mlkem_b64: b64e(pub), mlkem_sig_b64: b64e(sign(id.edSk, msg)) };
 }
 
 export async function login(
@@ -118,7 +130,14 @@ export async function ensureAliceSession(
   const eph = freshX();
   const bobSpk = b64d(bundle.signed_prekey.pub_b64);
   const bobOpk = bundle.one_time_prekey ? b64d(bundle.one_time_prekey.pub_b64) : null;
-  const sk = x3dhAlice(snap.identity.xSk, eph.sk, b64d(peer.xPk), bobSpk, bobOpk);
+  let sk = x3dhAlice(snap.identity.xSk, eph.sk, b64d(peer.xPk), bobSpk, bobOpk);
+  let pqCt: string | undefined;
+  const mlkem = (bundle as { identity_mlkem_b64?: string | null }).identity_mlkem_b64;
+  if (mlkem && snap.identity.pqSeed && snap.identity.pqSeed.length === 64) {
+    const enc = pqEncaps(b64d(mlkem));
+    sk = hybridRoot(sk, enc.sharedSecret);
+    pqCt = b64e(enc.cipherText);
+  }
   const st = initAlice(sk, bobSpk);
   putRatchet(snap, peer.mailboxId, st, {
     established: true,
@@ -126,6 +145,7 @@ export async function ensureAliceSession(
     pendingSpkId: bundle.signed_prekey.key_id,
     pendingOpkId: bundle.one_time_prekey?.key_id,
     theirSpk: bundle.signed_prekey.pub_b64,
+    pqCt,
   });
   // stash eph pub on the state via a side field on session
   (snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string }).ephPk = b64e(eph.pk);
@@ -152,7 +172,8 @@ export type Payload =
   | { kind: "receipt"; id: string; upTo: string }
   | { kind: "typing"; id: string }
   | { kind: "ctrl"; id: string; op: string; data?: unknown }
-  | { kind: "call"; id: string; phase: "offer" | "answer" | "ice" | "hangup" | "missed"; sdp?: string; candidate?: string; media?: "audio" | "video" };
+  | { kind: "call"; id: string; phase: "offer" | "answer" | "ice" | "hangup" | "missed"; sdp?: string; candidate?: string; media?: "audio" | "video" }
+  | { kind: "location"; id: string; text: string; lat: number; lon: number; until: number };
 
 export async function sendSealed(
   snap: VaultSnapshot,
@@ -165,23 +186,26 @@ export async function sendSealed(
   const rec = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
   const { header, ciphertext } = ratchetEncrypt(st, encodePt(payload));
   putRatchet(snap, peer.mailboxId, st, rec);
-  const isPk = Boolean(rec.pendingEphSk);
+  const stored = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
+  const isPk = Boolean(stored.pendingEphSk);
   const inner = signInner(snap.identity, {
     v: 1,
     t: payload.kind === "intro" ? "intro" : isPk ? "pkmsg" : "msg",
     sid: b64e(snap.identity.edPk),
     spk: b64e(snap.identity.xPk),
     mid: snap.identity.mailboxId,
-    ek: rec.ephPk,
-    used_opk: rec.pendingOpkId,
-    used_spk: rec.pendingSpkId,
+    ek: stored.ephPk,
+    used_opk: stored.pendingOpkId,
+    used_spk: stored.pendingSpkId,
+    pq: isPk ? stored.pqCt : undefined,
     h: header,
     ct: b64e(ciphertext),
     ts: Date.now(),
   });
   if (isPk) {
-    rec.pendingEphSk = undefined;
-    rec.ephPk = undefined;
+    stored.pendingEphSk = undefined;
+    stored.ephPk = undefined;
+    stored.pqCt = undefined;
   }
   const blob = sealOuter(b64d(peer.xPk), encodeInner(inner));
   await api.drop(token, {
@@ -222,7 +246,15 @@ export function openIncoming(
     if (!inner.ek) return null;
     const aliceEph = b64d(inner.ek);
     const opk = inner.used_opk != null ? holds.opks.find((k) => k.id === inner.used_opk) : undefined;
-    const sk = x3dhBob(snap.identity.xSk, holds.spk.sk, fromX, aliceEph, opk?.sk ?? null);
+    let sk = x3dhBob(snap.identity.xSk, holds.spk.sk, fromX, aliceEph, opk?.sk ?? null);
+    if (inner.pq) {
+      if (!snap.identity.pqSeed || snap.identity.pqSeed.length !== 64) return null;
+      try {
+        sk = hybridRoot(sk, pqDecaps(b64d(inner.pq), snap.identity.pqSeed));
+      } catch {
+        return null;
+      }
+    }
     st = initBob(sk, holds.spk.sk, holds.spk.pk);
     snap.sessions[peerId] = {
       peerMailboxId: peerId,

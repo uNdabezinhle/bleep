@@ -14,6 +14,8 @@ export type Identity = {
   xSk: Uint8Array;
   xPk: Uint8Array;
   displayName: string;
+  /** FIPS 203 ML-KEM-768 seed, d || z. Empty on a vault created before the hybrid. */
+  pqSeed?: Uint8Array;
 };
 
 export function randomMailboxId(): string {
@@ -29,7 +31,7 @@ export function generateIdentity(displayName: string, mailboxId = randomMailboxI
   const edPk = ed25519.getPublicKey(edSk);
   const xSk = x25519.utils.randomPrivateKey();
   const xPk = x25519.getPublicKey(xSk);
-  return { mailboxId, edSk, edPk, xSk, xPk, displayName };
+  return { mailboxId, edSk, edPk, xSk, xPk, displayName, pqSeed: randomBytes(64) };
 }
 
 export function freshRecoverySeed(): Uint8Array {
@@ -59,6 +61,7 @@ export function identityFromSeed(displayName: string, seed: Uint8Array): Identit
     xSk,
     xPk: x25519.getPublicKey(xSk),
     displayName,
+    pqSeed: kdf(seed, utf8("bleep-pq"), "ml-kem-768", 64),
   };
 }
 

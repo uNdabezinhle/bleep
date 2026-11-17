@@ -50,6 +50,7 @@ export type StoredIdentity = {
   xSk: string;
   xPk: string;
   displayName: string;
+  pqSeed?: string;
 };
 
 export function dumpIdentity(id: Identity): StoredIdentity {
@@ -60,6 +61,7 @@ export function dumpIdentity(id: Identity): StoredIdentity {
     xSk: b64e(id.xSk),
     xPk: b64e(id.xPk),
     displayName: id.displayName,
+    pqSeed: id.pqSeed && id.pqSeed.length === 64 ? b64e(id.pqSeed) : undefined,
   };
 }
 
@@ -71,6 +73,7 @@ export function loadIdentity(s: StoredIdentity): Identity {
     xSk: b64d(s.xSk),
     xPk: b64d(s.xPk),
     displayName: s.displayName,
+    pqSeed: s.pqSeed ? b64d(s.pqSeed) : undefined,
   };
 }
 

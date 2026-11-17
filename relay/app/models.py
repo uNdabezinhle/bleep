@@ -25,6 +25,30 @@ class Mailbox(Base):
     region: Mapped[str] = mapped_column(String(16), default="ZA-JHB")
     bytes_in_flight: Mapped[int] = mapped_column(Integer, default=0)
     account_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    mlkem_pub: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Channel(Base):
+    """Public room. Posts are plaintext. The relay can read them."""
+
+    __tablename__ = "channels"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(40), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    owner_mailbox: Mapped[str] = mapped_column(String(64))
+
+
+class ChannelPost(Base):
+    __tablename__ = "channel_posts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    channel_id: Mapped[str] = mapped_column(String(32), ForeignKey("channels.id"), index=True)
+    author_mailbox: Mapped[str] = mapped_column(String(64))
+    author_name: Mapped[str] = mapped_column(String(40))
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class Account(Base):

@@ -23,6 +23,7 @@ export type InnerMessage = {
   ct: string;
   ts: number;
   sig: string;
+  pq?: string;
 };
 
 export function sealOuter(destXPk: Uint8Array, inner: Uint8Array): Uint8Array {

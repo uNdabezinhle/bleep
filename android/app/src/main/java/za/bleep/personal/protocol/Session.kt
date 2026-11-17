@@ -92,6 +92,8 @@ class Session(private val relay: Relay) {
     val peers = mutableMapOf<String, Peer>()
     val ratchets = mutableMapOf<String, RatchetState>()
     val ephPk = mutableMapOf<String, ByteArray>()
+    val pendingPq = mutableMapOf<String, ByteArray>()
+    val presence = mutableMapOf<String, Pair<Boolean, String?>>()
     val pendingPk = mutableSetOf<String>()
     val threads = mutableMapOf<String, MutableList<ChatMsg>>()
     val groupThreads = mutableMapOf<String, MutableList<ChatMsg>>()
@@ -185,6 +187,7 @@ class Session(private val relay: Relay) {
                 },
             )
             .put("registration_sig_b64", Bytes.b64e(Crypto.sign(id.edSk, Crypto.registrationMessage(id.mailboxId, id.xPk))))
+        attachMlkem(body, id)
         val res = relay.register(body)
         token = res.getString("token")
         shortId = res.optString("short_id").ifBlank { null }
@@ -240,6 +243,7 @@ class Session(private val relay: Relay) {
             .put("edPk", Bytes.b64e(id.edPk))
             .put("xSk", Bytes.b64e(id.xSk))
             .put("xPk", Bytes.b64e(id.xPk))
+            .put("pqSeed", if (id.pqSeed.isEmpty()) JSONObject.NULL else Bytes.b64e(id.pqSeed))
             .put("spkSk", Bytes.b64e(spk.sk))
             .put("spkPk", Bytes.b64e(spk.pk))
             .put("peers", peersJ)
@@ -290,6 +294,7 @@ class Session(private val relay: Relay) {
             Bytes.b64d(snap.getString("xSk")),
             Bytes.b64d(snap.getString("xPk")),
             snap.getString("displayName"),
+            if (snap.isNull("pqSeed")) ByteArray(0) else Bytes.b64d(snap.optString("pqSeed")),
         )
         spk = XPair(Bytes.b64d(snap.getString("spkSk")), Bytes.b64d(snap.getString("spkPk")))
         recoverySeed = snap.optString("recoverySeed").ifBlank { null }
@@ -512,6 +517,7 @@ class Session(private val relay: Relay) {
             .put("ct", Bytes.b64e(ct))
             .put("ts", System.currentTimeMillis())
         ephPk.remove(peer.mailboxId)?.let { unsigned.put("ek", Bytes.b64e(it)) }
+        if (isPk) pendingPq.remove(peer.mailboxId)?.let { unsigned.put("pq", Bytes.b64e(it)) }
         val sig = Crypto.sign(id.edSk, Bytes.utf8(Canonical.of(unsigned)))
         unsigned.put("sig", Bytes.b64e(sig))
         val blob = Seal.outer(peer.xPk, Bytes.utf8(unsigned.toString()))
@@ -619,6 +625,7 @@ class Session(private val relay: Relay) {
             .put("ct", Bytes.b64e(ct))
             .put("ts", System.currentTimeMillis())
         ephPk.remove(peer.mailboxId)?.let { unsigned.put("ek", Bytes.b64e(it)) }
+        if (isPk) pendingPq.remove(peer.mailboxId)?.let { unsigned.put("pq", Bytes.b64e(it)) }
         unsigned.put("sig", Bytes.b64e(Crypto.sign(id.edSk, Bytes.utf8(Canonical.of(unsigned)))))
         enqueueDrop(peer.mailboxId, Bytes.b64e(Seal.outer(peer.xPk, Bytes.utf8(unsigned.toString()))), ttlSeconds)
     }
@@ -657,6 +664,47 @@ class Session(private val relay: Relay) {
             ingest(blob)
         }
         sweep()
+        refreshPresence()
+    }
+
+    private fun refreshPresence() {
+        if (!ready) return
+        val ids = peers.values.filter { it.accepted }.map { it.mailboxId }.take(30)
+        if (ids.isEmpty()) return
+        try {
+            val rows = relay.presence(token, ids).optJSONArray("items") ?: return
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONObject(i)
+                presence[row.getString("mailbox_id")] = row.optBoolean("online") to row.optString("last_seen").ifBlank { null }
+            }
+        } catch (_: Exception) { }
+    }
+
+    fun sendLocation(peer: Peer, lat: Double, lon: Double, until: Long) {
+        val stop = java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(until))
+        val latText = java.lang.String.format(java.util.Locale.US, "%.5f", lat)
+        val lonText = java.lang.String.format(java.util.Locale.US, "%.5f", lon)
+        val text = "Live location $latText, $lonText until $stop. https://www.openstreetmap.org/?mlat=$latText&mlon=$lonText"
+        val msgId = java.util.UUID.randomUUID().toString()
+        sendPayload(peer, JSONObject().put("kind", "location").put("id", msgId).put("text", text).put("lat", lat).put("lon", lon).put("until", until), intro = false)
+        threads.getOrPut(peer.mailboxId) { mutableListOf() } += ChatMsg(msgId, true, text, System.currentTimeMillis(), peer.mailboxId)
+    }
+
+    fun createChannel(name: String): String = relay.createChannel(token, name).getString("id")
+
+    fun channelNames(): org.json.JSONArray = relay.channels(token).optJSONArray("items") ?: org.json.JSONArray()
+
+    fun channelPosts(id: String): org.json.JSONArray = relay.channelPosts(token, id).optJSONArray("posts") ?: org.json.JSONArray()
+
+    fun postChannel(channelId: String, text: String) {
+        relay.postChannel(token, channelId, text, id.displayName)
+    }
+
+    private fun attachMlkem(body: JSONObject, ident: Identity) {
+        if (ident.pqSeed.size != 64) return
+        val pub = Crypto.pqPublic(ident.pqSeed)
+        body.put("identity_mlkem_b64", Bytes.b64e(pub))
+        body.put("mlkem_sig_b64", Bytes.b64e(Crypto.sign(ident.edSk, Bytes.concat(Bytes.utf8("BLEEP-MLKEM-v1|"), pub))))
     }
 
     private fun ingest(blobB64: String) {
@@ -680,7 +728,16 @@ class Session(private val relay: Relay) {
         var st = ratchets[mid]
         if (st == null) {
             if (!inner.has("ek")) return
-            val sk = Ratchet.x3dhBob(id.xSk, spk.sk, fromX, Bytes.b64d(inner.getString("ek")), null)
+            var sk = Ratchet.x3dhBob(id.xSk, spk.sk, fromX, Bytes.b64d(inner.getString("ek")), null)
+            val pq = inner.optString("pq")
+            if (pq.isNotBlank()) {
+                if (id.pqSeed.size != 64) return
+                sk = try {
+                    Ratchet.hybridRoot(sk, Crypto.pqDecaps(Bytes.b64d(pq), id.pqSeed))
+                } catch (_: Exception) {
+                    return
+                }
+            }
             st = Ratchet.initBob(sk, spk.sk, spk.pk)
             ratchets[mid] = st
         }
@@ -1826,6 +1883,7 @@ class Session(private val relay: Relay) {
                 },
             )
             .put("registration_sig_b64", Bytes.b64e(Crypto.sign(ident.edSk, Crypto.registrationMessage(ident.mailboxId, ident.xPk))))
+        attachMlkem(body, ident)
         return relay.register(body).getString("token")
     }
 
@@ -1979,7 +2037,13 @@ class Session(private val relay: Relay) {
         val eph = Crypto.freshX()
         val bobSpk = Bytes.b64d(bundle.getJSONObject("signed_prekey").getString("pub_b64"))
         val opk = bundle.optJSONObject("one_time_prekey")?.let { Bytes.b64d(it.getString("pub_b64")) }
-        val sk = Ratchet.x3dhAlice(id.xSk, eph.sk, peer.xPk, bobSpk, opk)
+        var sk = Ratchet.x3dhAlice(id.xSk, eph.sk, peer.xPk, bobSpk, opk)
+        val mlkem = bundle.optString("identity_mlkem_b64")
+        if (mlkem.isNotBlank() && id.pqSeed.size == 64) {
+            val enc = Crypto.pqEncaps(Bytes.b64d(mlkem))
+            sk = Ratchet.hybridRoot(sk, enc.second)
+            pendingPq[peer.mailboxId] = enc.first
+        }
         ratchets[peer.mailboxId] = Ratchet.initAlice(sk, bobSpk)
         ephPk[peer.mailboxId] = eph.pk
         pendingPk += peer.mailboxId

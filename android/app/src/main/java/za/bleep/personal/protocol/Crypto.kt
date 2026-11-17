@@ -12,6 +12,11 @@ import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMExtractor
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMGenerator
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMPrivateKeyParameters
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMPublicKeyParameters
 import java.security.SecureRandom
 import java.util.Base64
 
@@ -24,6 +29,7 @@ data class Identity(
     val xSk: ByteArray,
     val xPk: ByteArray,
     val displayName: String,
+    val pqSeed: ByteArray = ByteArray(0),
 )
 
 data class XPair(val sk: ByteArray, val pk: ByteArray)
@@ -76,10 +82,25 @@ object Crypto {
             xSk = x.encoded,
             xPk = x.generatePublicKey().encoded,
             displayName = displayName,
+            pqSeed = kdf(seed, Bytes.utf8("bleep-pq"), "ml-kem-768", 64),
         )
     }
 
     fun historyKey(seed: ByteArray): ByteArray = kdf(seed, Bytes.utf8("bleep-hist"), "bleep-history-v1", 32)
+
+    fun pqPublic(seed64: ByteArray): ByteArray =
+        MLKEMPrivateKeyParameters(MLKEMParameters.ml_kem_768, seed64).publicKey
+
+    fun pqEncaps(publicKey: ByteArray): Pair<ByteArray, ByteArray> {
+        val pub = MLKEMPublicKeyParameters(MLKEMParameters.ml_kem_768, publicKey)
+        val secret = MLKEMGenerator(SecureRandom()).generateEncapsulated(pub)
+        return secret.encapsulation to secret.secret
+    }
+
+    fun pqDecaps(cipherText: ByteArray, seed64: ByteArray): ByteArray {
+        val priv = MLKEMPrivateKeyParameters(MLKEMParameters.ml_kem_768, seed64)
+        return MLKEMExtractor(priv).extractSecret(cipherText)
+    }
 
     fun generateIdentity(displayName: String): Identity {
         val ed = Ed25519PrivateKeyParameters(Bytes.random(32))
@@ -91,6 +112,7 @@ object Crypto {
             xSk = x.encoded,
             xPk = x.generatePublicKey().encoded,
             displayName = displayName,
+            pqSeed = Bytes.random(64),
         )
     }
 

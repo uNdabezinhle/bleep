@@ -1,10 +1,15 @@
 package za.bleep.personal.protocol
 
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMGenerator
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMParameters
+import org.bouncycastle.pqc.crypto.mlkem.MLKEMPublicKeyParameters
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.security.MessageDigest
+import java.security.SecureRandom
 import za.bleep.personal.net.AccountRequests
 
 class ProtocolTest {
@@ -125,4 +130,26 @@ class ProtocolTest {
         val b = ByteArray(32) { (31 - it).toByte() }
         assertEquals(Crypto.safetyNumber(a, b), Crypto.safetyNumber(b, a))
     }
+
+    @Test
+    fun mlkem768MatchesNobleVector() {
+        val seed = ByteArray(64) { 7 }
+        val pk = Crypto.pqPublic(seed)
+        assertEquals(1184, pk.size)
+        assertEquals("c12e9e39db6758fc2ba63a638785b04f8efe3d7df23ba09803b4e39ba2fbc707", sha256(pk))
+        val coins = ByteArray(32) { 0x11 }
+        val enc = MLKEMGenerator(SecureRandom()).internalGenerateEncapsulated(
+            MLKEMPublicKeyParameters(MLKEMParameters.ml_kem_768, pk),
+            coins,
+        )
+        assertEquals("c2084133f3d3988f2f5ae955578d76a90db033f2dad1b390bd94c3c6a79a3972", sha256(enc.encapsulation))
+        val ss = Crypto.pqDecaps(enc.encapsulation, seed)
+        assertArrayEquals(enc.secret, ss)
+        assertEquals("de59a0c10debc45ca92ecf429aad94a2314b6e18635e7774dc3207fc3b3b7b36", sha256(ss))
+        val x3dh = ByteArray(32) { 3 }
+        assertFalse(Ratchet.hybridRoot(x3dh, ss).contentEquals(x3dh))
+    }
+
+    private fun sha256(b: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
 }

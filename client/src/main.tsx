@@ -7,7 +7,7 @@ import "./styles.css";
 
 function Root() {
   const path = useRoute();
-  if (path === "/app" || path === "/register") return <App path={path} />;
+  if (path === "/app" || path === "/register" || path === "/signin") return <App path={path} />;
   return <Site path={path} />;
 }
 

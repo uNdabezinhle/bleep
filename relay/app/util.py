@@ -26,6 +26,14 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def hour_band(ts: datetime | None = None) -> str:
     t = ts or utcnow()
     return t.strftime("%Y-%m-%dT%H")

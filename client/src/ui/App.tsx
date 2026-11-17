@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import jsQR from "jsqr";
-import { rt } from "./instance";
 import { api } from "../net/api";
+import { rt } from "./instance";
 import { disappearAction, disappearPhrase, muteAction, replySnippet } from "../chat/prefs";
 import { bleepCode, formatRecovery, formatShortId, freshRecoverySeed } from "../protocol/keys";
 import { pairSafety } from "../session/session";
@@ -44,7 +44,7 @@ const ICON = {
   video: "M4 7h10v10H4z M14 10l6-3v10l-6-3z",
 } as const;
 
-function inList(t: Thread, mode: "chats" | "chambers" | "groups"): boolean {
+function inList(t: Thread, mode: "chats" | "chambers" | "groups" | "channels"): boolean {
   if (mode === "chambers") return t.kind === "chamber";
   if (mode === "groups") return t.kind === "group" && !t.archived;
   return t.kind !== "chamber" && t.kind !== "group" && !t.archived;
@@ -104,12 +104,19 @@ function Receipt({ status }: { status?: Message["status"] }) {
   return null;
 }
 
+function presenceLine(row: { online: boolean; lastSeen: string | null } | undefined): string {
+  if (!row) return "";
+  if (row.online) return "Online · ";
+  if (!row.lastSeen) return "";
+  return `Last seen ${new Date(row.lastSeen).toLocaleString()} · `;
+}
+
 export function App({ path = "/app" }: { path?: string }) {
   const [, setTick] = useState(0);
   const bump = () => setTick((x) => x + 1);
   const [gate, setGate] = useState<Gate>("boot");
   const [tab, setTab] = useState<Tab>("chats");
-  const [listMode, setListMode] = useState<"chats" | "chambers" | "groups">("chats");
+  const [listMode, setListMode] = useState<"chats" | "chambers" | "groups" | "channels">("chats");
   const [threadId, setThreadId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [find, setFind] = useState("");
@@ -141,11 +148,12 @@ export function App({ path = "/app" }: { path?: string }) {
 
   const resetToken = new URLSearchParams(location.search).get("reset");
   const confirmToken = new URLSearchParams(location.search).get("confirm");
-  if (path === "/register" || resetToken || confirmToken) {
+  if (path === "/register" || path === "/signin" || resetToken || confirmToken) {
     if (gate === "boot") return <div className="screen"><div className="card">Opening vault…</div></div>;
     return (
       <RegisterFlow
         hasVault={gate !== "setup"}
+        startMode={resetToken ? "reset" : path === "/signin" ? "signin" : "create"}
         resetToken={resetToken}
         confirmToken={confirmToken}
         onDone={() => {
@@ -219,8 +227,9 @@ export function App({ path = "/app" }: { path?: string }) {
               <button className={listMode === "chats" ? "on" : ""} onClick={() => { setListMode("chats"); setThreadId(null); }}>Chats</button>
               <button className={listMode === "chambers" ? "on" : ""} onClick={() => { setListMode("chambers"); setThreadId(null); }}>Chambers</button>
               <button className={listMode === "groups" ? "on" : ""} onClick={() => { setListMode("groups"); setThreadId(null); }}>Groups</button>
+              <button className={listMode === "channels" ? "on" : ""} onClick={() => { setListMode("channels"); setThreadId(null); }}>Channels</button>
             </div>
-            {listMode !== "chambers" && (
+            {listMode !== "chambers" && listMode !== "channels" && (
               <input
                 className="find"
                 value={find}
@@ -229,7 +238,7 @@ export function App({ path = "/app" }: { path?: string }) {
                 onChange={(e) => setFind(e.target.value)}
               />
             )}
-            <div className="list">
+            {listMode === "channels" ? <ChannelsPane /> : <div className="list">
               {threads.length === 0 && (
                 <div className="empty">
                   {q
@@ -257,7 +266,7 @@ export function App({ path = "/app" }: { path?: string }) {
                   </div>
                 </button>
               ))}
-            </div>
+            </div>}
           </aside>
         )}
         {showMain && (
@@ -358,18 +367,28 @@ function Features() {
   );
 }
 
+function accountPath(next: "signin" | "create") {
+  const params = new URLSearchParams(location.search);
+  params.delete("reset");
+  params.delete("confirm");
+  const q = params.toString();
+  navigate((next === "signin" ? "/signin" : "/register") + (q ? `?${q}` : ""));
+}
+
 function RegisterFlow({
   hasVault,
+  startMode,
   resetToken,
   confirmToken,
   onDone,
 }: {
   hasVault: boolean;
+  startMode: "create" | "signin" | "reset";
   resetToken: string | null;
   confirmToken: string | null;
   onDone: () => void;
 }) {
-  const [mode, setMode] = useState<"create" | "signin" | "reset">(resetToken ? "reset" : "create");
+  const [mode, setMode] = useState<"create" | "signin" | "reset">(startMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [again, setAgain] = useState("");
@@ -487,8 +506,8 @@ function RegisterFlow({
           {err && <p className="warn">{err}</p>}
           {notice && <p className="note">{notice}</p>}
           <button className="primary" disabled={busy}>{busy ? "Working…" : mode === "signin" ? "Open vault" : mode === "reset" ? "Update password" : seed ? "Create account" : "Show recovery code"}</button>
-          {mode === "create" && <button type="button" className="ghost" onClick={() => setMode("signin")}>Already have an account</button>}
-          {mode === "signin" && <button type="button" className="ghost" onClick={() => { setMode("create"); setSeed(null); }}>Create an account</button>}
+          {mode === "create" && <button type="button" className="ghost" onClick={() => { setMode("signin"); accountPath("signin"); }}>Sign in</button>}
+          {mode === "signin" && <button type="button" className="ghost" onClick={() => { setMode("create"); setSeed(null); accountPath("create"); }}>Create an account</button>}
           {mode !== "reset" && (
             <button
               type="button"
@@ -525,13 +544,14 @@ function Setup({ err }: { err: string }) {
         <Features />
         <div className="card">
           <div className="chip">JHB · ZA</div>
-          <h1>Create an account</h1>
+          <h1>Open Bleep</h1>
           <p className="lead">
-            The key is made in this browser. Email is the login. The recovery code stays with you.{" "}
+            Email is the login. A new device also needs the recovery code. The password alone does not open the key.{" "}
             <a href="/hashes.html">Download Android APK</a>
           </p>
           {err && <p className="warn">{err}</p>}
-          <a className="primary" href="/register" onClick={(e) => { e.preventDefault(); navigate(`/register${location.search}`); }}>Create an account</a>
+          <a className="primary" href="/signin" onClick={(e) => { e.preventDefault(); navigate(`/signin${location.search}`); }}>Sign in</a>
+          <p className="note"><a href="/register" onClick={(e) => { e.preventDefault(); navigate(`/register${location.search}`); }}>Create an account</a></p>
         </div>
       </div>
     </div>
@@ -688,10 +708,11 @@ function ThreadView({
           <h2>{thread.title}</h2>
           <div className="sub">
             {peer ? (peer.verified ? "verified · " : "unverified · ") : ""}
+            {peer && thread.kind === "dm" ? presenceLine(rt.presence[peer.mailboxId]) : ""}
             {thread.peerTypingUntil && thread.peerTypingUntil > Date.now() ? "typing · " : ""}
             {disappearPhrase(thread.disappearingSec)}
             {peer?.nickname ? ` · ${peer.displayName}` : ""}
-            {" · A capture on their side is not reported."}
+            {" · The Android app blocks the system screenshot. This browser cannot. A photograph of the screen still works."}
             <span className={"tick" + (thread.receipts ? " read" : "")} role="img" aria-label={thread.receipts ? "Read receipts on" : "Read receipts off"}>
               <Icon d={thread.receipts ? ICON.checks : ICON.check} />
             </span>
@@ -849,6 +870,7 @@ function ThreadView({
         >
           <Icon d={ICON.eye} />
         </button>
+        {thread.kind === "dm" && peer && <LiveLocation thread={thread} />}
         <textarea
           rows={1}
           placeholder="Message"
@@ -867,6 +889,94 @@ function ThreadView({
         <button className="iconbtn primary" aria-label="Send" onClick={() => void send()}><Icon d={ICON.send} /></button>
       </div>}
     </>
+  );
+}
+
+function LiveLocation({ thread }: { thread: Thread }) {
+  const [on, setOn] = useState(false);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    if (!on || !navigator.geolocation) return;
+    const until = Date.now() + 15 * 60 * 1000;
+    let last = 0;
+    const watch = navigator.geolocation.watchPosition(
+      (pos) => {
+        const now = Date.now();
+        if (now > until) {
+          setOn(false);
+          return;
+        }
+        if (now - last < 20000) return;
+        last = now;
+        void rt.sendLocation(thread, pos.coords.latitude, pos.coords.longitude, until);
+      },
+      () => setErr("Location permission was not granted."),
+      { enableHighAccuracy: true, maximumAge: 10000 },
+    );
+    return () => navigator.geolocation.clearWatch(watch);
+  }, [on, thread]);
+  if (!navigator.geolocation) return null;
+  return (
+    <button type="button" className="ghost" onClick={() => { setErr(""); setOn((v) => !v); }}>
+      {on ? "Stop live location" : "Live location"}
+      {err ? ` ${err}` : ""}
+    </button>
+  );
+}
+
+function ChannelsPane() {
+  const [items, setItems] = useState<{ id: string; name: string }[]>([]);
+  const [name, setName] = useState("");
+  const [open, setOpen] = useState<string | null>(null);
+  const [posts, setPosts] = useState<{ id: string; name: string; text: string }[]>([]);
+  const [text, setText] = useState("");
+  const [err, setErr] = useState("");
+  const load = () => {
+    if (!rt.token) return;
+    void api.channels(rt.token).then((body) => {
+      setItems((body as { items: { id: string; name: string }[] }).items ?? []);
+    }).catch((e) => setErr((e as Error).message));
+  };
+  useEffect(load, []);
+  useEffect(() => {
+    if (!open || !rt.token) return;
+    void api.channelPosts(rt.token, open).then((body) => {
+      setPosts((body as { posts: { id: string; name: string; text: string }[] }).posts ?? []);
+    }).catch((e) => setErr((e as Error).message));
+  }, [open]);
+  return (
+    <div className="list" style={{ padding: 12 }}>
+      <p className="note">A public channel is readable by any Bleep account. The relay stores the text in the clear.</p>
+      {err && <p className="warn">{err}</p>}
+      <form onSubmit={(e) => {
+        e.preventDefault();
+        if (!rt.token || !name.trim()) return;
+        void api.createChannel(rt.token, name.trim()).then(() => { setName(""); load(); }).catch((ex) => setErr((ex as Error).message));
+      }}>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Channel name" aria-label="Channel name" />
+        <button className="ghost" type="submit">Create channel</button>
+      </form>
+      {items.map((ch) => (
+        <button key={ch.id} type="button" className="row" onClick={() => setOpen(ch.id)}>{ch.name}</button>
+      ))}
+      {open && (
+        <div>
+          {posts.map((p) => <p key={p.id}><b>{p.name}</b> {p.text}</p>)}
+          <form onSubmit={(e) => {
+            e.preventDefault();
+            if (!rt.token || !text.trim()) return;
+            const who = rt.snap?.settings.handle || rt.snap?.identity.displayName || "Someone";
+            void api.postChannel(rt.token, open, text.trim(), who).then(() => {
+              setText("");
+              return api.channelPosts(rt.token!, open);
+            }).then((body) => setPosts((body as { posts: { id: string; name: string; text: string }[] }).posts ?? [])).catch((ex) => setErr((ex as Error).message));
+          }}>
+            <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Post" aria-label="Post" />
+            <button className="ghost" type="submit">Post</button>
+          </form>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -13,7 +13,7 @@ or “audited” until that review exists.
 | AEAD | ChaCha20-Poly1305 | `@noble/ciphers` |
 | KDF | HKDF-SHA-256 | `@noble/hashes` |
 | 1:1 session | X3DH + Double Ratchet (Signal lineage) | this repo `client/src/protocol` |
-| PQ hybrid | not in v1 | residual; add when a reviewed construction exists |
+| PQ hybrid | ML-KEM-768 (FIPS 203) mixed by HKDF(X3DH \|\| KEM), info `bleep-pqxdh-v1` | `@noble/post-quantum` and Bouncy Castle 1.81. Outer envelope stays X25519. A peer with no ML-KEM key stays on X3DH. |
 | Group v1 | signed membership on clients; pairwise sealed fan-out | residual T7 group leak |
 | Store wrap | PIN → PBKDF2-SHA-256 → AES-256-GCM | Web Crypto |
 | Account password | Argon2id verifier | relay: `argon2-cffi` |
@@ -137,6 +137,8 @@ Default and only v1 pin: `ZA-JHB`. Clients send `X-Bleep-Region`. A mismatch
 returns `421` and the client fails closed (T21). Silent roam is a bug.
 
 ## Chamber and Guardian
+
+A public channel post is plaintext on the relay. Any live mailbox can read it. Precise last-seen is the mailbox timestamp of the latest mail fetch, returned only to an authenticated mailbox, and “online” means that timestamp is under 45 seconds old. Live location is a sealed 1:1 message the sender starts and can stop. It is not a background tracker. The Android client sets FLAG_SECURE, which blocks the system screenshot and screen recording. A photograph of the screen still works. The browser cannot stop a screenshot.
 
 Chamber and Guardian are client modes. A Chamber is a fresh keypair + mailbox
 + store + lock + burn deadline. The relay stores an extra ciphertext under an

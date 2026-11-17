@@ -117,6 +117,7 @@ export class Runtime {
   private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
   private pendingOffer: RTCSessionDescriptionInit | null = null;
+  presence: Record<string, { online: boolean; lastSeen: string | null }> = {};
   private callTimer: number | null = null;
   private labelsReady = false;
 
@@ -790,11 +791,51 @@ export class Runtime {
     return run;
   }
 
+  private async refreshPresence(): Promise<void> {
+    if (!this.token || !this.snap) return;
+    const ids = Object.values(this.snap.peers).filter((p) => p.accepted).map((p) => p.mailboxId).slice(0, 30);
+    if (!ids.length) return;
+    const body = (await api.presence(this.token, ids)) as { items: { mailbox_id: string; online: boolean; last_seen: string | null }[] };
+    const next: Runtime["presence"] = {};
+    for (const row of body.items ?? []) next[row.mailbox_id] = { online: row.online, lastSeen: row.last_seen };
+    this.presence = next;
+  }
+
+  async sendLocation(thread: Thread, lat: number, lon: number, until: number): Promise<void> {
+    if (!this.snap || !this.token || thread.kind !== "dm") return;
+    const peers = this.destPeers(thread);
+    const peer = peers[0];
+    if (!peer || peer.safetyChanged) return;
+    const text = `Live location ${lat.toFixed(5)}, ${lon.toFixed(5)} until ${new Date(until).toLocaleTimeString()}. https://www.openstreetmap.org/?mlat=${lat.toFixed(5)}&mlon=${lon.toFixed(5)}`;
+    const id = crypto.randomUUID();
+    const payload: Payload = { kind: "location", id, text, lat, lon, until };
+    const th = this.snap.threads[thread.id];
+    const msg: Message = {
+      id,
+      threadId: thread.id,
+      fromMe: true,
+      kind: "location",
+      text,
+      at: Date.now(),
+      lat,
+      lon,
+      until,
+    };
+    this.snap.messages[thread.id] = [...(this.snap.messages[thread.id] ?? []), msg];
+    if (th) {
+      th.lastAt = msg.at;
+      th.lastPreview = "Live location";
+    }
+    await this.tryDrop(peer, payload, msg);
+    this.bump();
+  }
+
   private async pollBody(): Promise<void> {
     if (!this.token || !this.snap || this.locked) return;
     try {
       const items = (await api.fetch(this.token)) as { id: string; blob_b64: string }[];
       for (const it of items) this.ingest(it.blob_b64);
+      await this.refreshPresence();
       await this.liftShortIds();
       await this.flushOutbox();
       this.sweepDisappearing();
@@ -964,7 +1005,7 @@ export class Runtime {
       return;
     }
 
-    if (inc.payload.kind === "intro" || inc.payload.kind === "text" || inc.payload.kind === "photo" || inc.payload.kind === "voice" || inc.payload.kind === "file") {
+    if (inc.payload.kind === "intro" || inc.payload.kind === "text" || inc.payload.kind === "photo" || inc.payload.kind === "voice" || inc.payload.kind === "file" || inc.payload.kind === "location") {
       const p = inc.payload;
       if (!peer.accepted && p.kind !== "intro") {
         this.snap.requests.push({
@@ -1963,6 +2004,15 @@ export class Runtime {
               kind: "text",
               id: m.id,
               text: m.text,
+            });
+          } else if (m.kind === "location" && m.lat != null && m.lon != null && m.until != null) {
+            await sendSealed(this.snap, this.token, peer, {
+              kind: "location",
+              id: m.id,
+              text: m.text,
+              lat: m.lat,
+              lon: m.lon,
+              until: m.until,
             });
           } else if (m.attachmentId) {
             const att = await this.vault.getAttachment(m.attachmentId);

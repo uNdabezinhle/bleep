@@ -303,6 +303,9 @@ input:focus, textarea:focus { border-color: var(--accent); }
   .invite .features ul { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 }
 
+@media print {
+  .msgs, .bubble, .composer, .col-list { display: none !important; }
+}
 @media (max-width: 839px) {
   .workspace, .workspace.no-list { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
   .dock {

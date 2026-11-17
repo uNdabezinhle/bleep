@@ -51,6 +51,9 @@ object Ratchet {
         return Crypto.kdf(parts, ZERO, "bleep-x3dh-v1", 32)
     }
 
+    fun hybridRoot(x3dh: ByteArray, kem: ByteArray): ByteArray =
+        Crypto.kdf(Bytes.concat(x3dh, kem), ZERO, "bleep-pqxdh-v1", 32)
+
     fun x3dhBob(bobXSk: ByteArray, bobSpkSk: ByteArray, aliceIdX: ByteArray, aliceEph: ByteArray, bobOpkSk: ByteArray?): ByteArray {
         val dh1 = Crypto.dh(bobSpkSk, aliceIdX)
         val dh2 = Crypto.dh(bobXSk, aliceEph)

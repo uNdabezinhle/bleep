@@ -44,7 +44,7 @@ export type Thread = {
   lockedStub?: boolean;
 };
 
-export type MsgKind = "text" | "photo" | "voice" | "file" | "system" | "call";
+export type MsgKind = "text" | "photo" | "voice" | "file" | "system" | "call" | "location";
 
 export type Message = {
   id: string;
@@ -72,6 +72,9 @@ export type Message = {
   groupId?: string;
   groupName?: string;
   needsDownload?: boolean;
+  lat?: number;
+  lon?: number;
+  until?: number;
 };
 
 export type SessionRec = {
@@ -82,6 +85,7 @@ export type SessionRec = {
   pendingSpkId?: number;
   pendingOpkId?: number;
   theirSpk?: string;
+  pqCt?: string;
 };
 
 export type Settings = {

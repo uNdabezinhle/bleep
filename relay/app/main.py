@@ -22,6 +22,7 @@ from .config import settings
 from .crypto import auth_message, registration_message, verify_ed25519
 from .db import Base, SessionLocal, engine, get_session
 from .accounts import guard_device, router as account_router
+from .channels import router as channel_router
 from .models import Account, DemandLog, Device, Envelope, HistoryBlob, HistoryExtra, HistoryFile, Mailbox, OneTimePrekey
 from .rate import check_drop, check_handle, check_prekey
 from .schemas import (
@@ -43,6 +44,7 @@ from .shortid import assign_short_id
 from .ttl import sweeper
 from .util import (
     HANDLE_RE,
+    as_utc,
     client_ip,
     hour_band,
     new_id,
@@ -65,6 +67,12 @@ def _add_account_id(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE mailboxes ADD COLUMN account_id VARCHAR(32)"))
     if "short_id" not in cols:
         sync_conn.execute(text("ALTER TABLE mailboxes ADD COLUMN short_id VARCHAR(8)"))
+    blob = "BYTEA" if sync_conn.dialect.name == "postgresql" else "BLOB"
+    stamp = "TIMESTAMPTZ" if sync_conn.dialect.name == "postgresql" else "DATETIME"
+    if "mlkem_pub" not in cols:
+        sync_conn.execute(text(f"ALTER TABLE mailboxes ADD COLUMN mlkem_pub {blob}"))
+    if "last_seen" not in cols:
+        sync_conn.execute(text(f"ALTER TABLE mailboxes ADD COLUMN last_seen {stamp}"))
     sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_mailboxes_short_id ON mailboxes (short_id)"))
     if "accounts" in insp.get_table_names():
         acols = {c["name"] for c in insp.get_columns("accounts")}
@@ -94,6 +102,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(account_router)
+app.include_router(channel_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,7 +128,7 @@ async def health(_region: str = Depends(require_region)):
         region=settings.bleep_region,
         fail_closed=True,
         env=settings.bleep_env,
-        holdings="sealed envelopes with TTL; sealed history blob; sealed file bytes; sealed extra blobs; email and password verifier; no plaintext; no sender column",
+        holdings="sealed envelopes with TTL; sealed history blob; sealed file bytes; sealed extra blobs; email and password verifier; public channel posts are plaintext; precise last_seen; no sender column on envelopes",
     )
 
 
@@ -202,6 +211,19 @@ async def register(
         raise HTTPException(status_code=400, detail="bad registration signature")
     if not verify_ed25519(ed, b"BLEEP-SPK-v1|" + body.signed_prekey.key_id.to_bytes(4, "big") + spk, spk_sig):
         raise HTTPException(status_code=400, detail="bad signed-prekey signature")
+    mlkem = None
+    if body.identity_mlkem_b64 or body.mlkem_sig_b64:
+        if not body.identity_mlkem_b64 or not body.mlkem_sig_b64:
+            raise HTTPException(status_code=400, detail="mlkem pair")
+        try:
+            mlkem = b64d(body.identity_mlkem_b64)
+            mlkem_sig = b64d(body.mlkem_sig_b64)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="bad mlkem") from exc
+        if len(mlkem) != 1184:
+            raise HTTPException(status_code=400, detail="bad mlkem length")
+        if not verify_ed25519(ed, b"BLEEP-MLKEM-v1|" + mlkem, mlkem_sig):
+            raise HTTPException(status_code=400, detail="bad mlkem signature")
     existing = await session.get(Mailbox, body.mailbox_id)
     if existing:
         raise HTTPException(status_code=409, detail="mailbox exists")
@@ -223,6 +245,7 @@ async def register(
         unlink_dead=False,
         region=settings.bleep_region,
         bytes_in_flight=0,
+        mlkem_pub=mlkem,
     )
     session.add(box)
     for opk in body.one_time_prekeys:
@@ -275,6 +298,7 @@ async def fetch_prekey(
             key_id=box.spk_id, pub_b64=b64e(box.spk_pub), sig_b64=b64e(box.spk_sig)
         ),
         one_time_prekey=opk,
+        identity_mlkem_b64=b64e(box.mlkem_pub) if box.mlkem_pub else None,
     )
 
 
@@ -403,8 +427,33 @@ async def fetch_mail(
         await session.delete(r)
     box.bytes_in_flight = max(0, box.bytes_in_flight - freed)
     box.last_connect_band = hour_band()
+    box.last_seen = now
     await session.commit()
     return out
+
+
+@app.get("/v1/presence")
+async def presence(
+    request: Request,
+    principal: Principal = Depends(require_mailbox),
+    session: AsyncSession = Depends(get_session),
+    _region: str = Depends(require_region),
+):
+    ids = request.query_params.getlist("mailbox_id")[:30]
+    now = utcnow()
+    items = []
+    for mid in ids:
+        if not mid or len(mid) > 64:
+            continue
+        box = await session.get(Mailbox, mid)
+        seen = as_utc(box.last_seen) if box else None
+        online = bool(seen and (now - seen).total_seconds() < 45)
+        items.append({
+            "mailbox_id": mid,
+            "last_seen": seen.isoformat() if seen else None,
+            "online": online,
+        })
+    return {"items": items}
 
 
 @app.put("/v1/handles", response_model=HandleOut)
@@ -511,7 +560,11 @@ async def ops_schema(authorization: str | None = Header(default=None)):
                 "unlink_dead",
                 "region",
                 "bytes_in_flight",
+                "mlkem_pub",
+                "last_seen",
             ],
+            "channels": ["id", "name", "created_at", "owner_mailbox"],
+            "channel_posts": ["id", "channel_id", "author_mailbox", "author_name", "body plaintext", "created_at"],
             "one_time_prekeys": ["mailbox_id", "key_id", "pub"],
             "envelopes": [
                 "id",
@@ -524,6 +577,7 @@ async def ops_schema(authorization: str | None = Header(default=None)):
             ],
             "demand_log": ["at", "mailbox_id", "kind", "note"],
         },
+        "held_plaintext": ["public channel posts", "precise last_seen timestamp"],
         "not_held": [
             "message plaintext",
             "attachment plaintext",
@@ -585,6 +639,7 @@ async def ops_holdings(
         "exists": True,
         "created_at": box.created_at.isoformat(),
         "last_connect_band": box.last_connect_band,
+        "last_seen": box.last_seen.isoformat() if box.last_seen else None,
         "handle_published": bool(box.handle),
         "handle": box.handle,
         "unlink_dead": box.unlink_dead,

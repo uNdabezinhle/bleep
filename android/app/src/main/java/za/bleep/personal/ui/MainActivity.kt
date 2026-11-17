@@ -79,6 +79,7 @@ private val Bad = Color(0xFFD46767)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE, android.view.WindowManager.LayoutParams.FLAG_SECURE)
         val app = application as BleepApp
         setContent { BleepRoot(app) }
     }
@@ -163,7 +164,7 @@ fun BleepRoot(app: BleepApp) {
 
 @Composable
 fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
-    var mode by remember { mutableStateOf("create") }
+    var mode by remember { mutableStateOf("signin") }
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var again by remember { mutableStateOf("") }
@@ -211,6 +212,16 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
             fontSize = 26.sp,
         )
         Text("The key is made on this phone. Email is the login. The recovery code is shown once and is not sent to the relay.", color = Mute)
+        if (mode != "reset") {
+            Row {
+                TextButton(onClick = { mode = "signin"; seed = null }) {
+                    Text("Sign in", color = if (mode == "signin") Amber else Mute)
+                }
+                TextButton(onClick = { mode = "create"; seed = null }) {
+                    Text("Create an account", color = if (mode == "create") Amber else Mute)
+                }
+            }
+        }
         if (mode != "reset") Field("Email", email) { email = it }
         Field(if (mode == "reset") "New password" else "Password", password, password = true) { password = it }
         if (mode == "create" && seed == null) {
@@ -286,8 +297,6 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
                 }
             }
         }
-        if (mode == "create") TextButton(onClick = { mode = "signin"; seed = null }) { Text("Already have an account", color = Amber) }
-        if (mode == "signin") TextButton(onClick = { mode = "create"; seed = null }) { Text("Create an account", color = Amber) }
         if (mode != "reset") TextButton(onClick = {
             if (email.isBlank()) { err = "Enter the email on the account."; return@TextButton }
             session.relayBase(url)
@@ -657,11 +666,15 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Row(Modifier.fillMaxWidth()) {
-            listOf("chats" to "Chats", "chambers" to "Chambers", "groups" to "Groups").forEach { (id, label) ->
+            listOf("chats" to "Chats", "chambers" to "Chambers", "groups" to "Groups", "channels" to "Channels").forEach { (id, label) ->
                 TextButton(onClick = { listMode = id }) {
                     Text(label, color = if (listMode == id) Amber else Mute, fontSize = 13.sp)
                 }
             }
+        }
+        if (listMode == "channels") {
+            ChannelsBlock(session, bump)
+            return@Column
         }
         if (listMode == "chambers") {
             if (session.chambers.isEmpty()) {
@@ -1047,7 +1060,18 @@ fun ThreadPane(
             if (note.isNotEmpty()) Text(note, color = Bad, fontSize = 12.sp)
             return@Column
         }
-        Text("Press and hold to reply. Capture is still possible.", color = Mute, fontSize = 12.sp)
+        if (dm && peer != null) {
+            val seen = session.presence[peer.mailboxId]
+            Text(
+                if (seen?.first == true) "Online. The time is the last mail fetch."
+                else if (seen?.second != null) "Last seen ${preciseSeen(seen.second!!)}."
+                else "No precise status yet.",
+                color = Mute,
+                fontSize = 12.sp,
+            )
+            LiveLocationButton(session, peer, bump)
+        }
+        Text("The system screenshot is blocked while Bleep is open. A photograph of the screen still works.", color = Mute, fontSize = 12.sp)
         Row {
             if (dm && peer != null) {
                 TextButton(onClick = { session.verifyPeer(peer); bump() }) { Text("Mark verified", color = Amber, fontSize = 12.sp) }
@@ -1411,6 +1435,128 @@ fun GuardianReport(session: Session, bump: () -> Unit, onMe: () -> Unit, onChats
             }
         }
     }
+}
+
+@Composable
+fun LiveLocationButton(session: Session, peer: Peer, bump: () -> Unit) {
+    var sharing by remember { mutableStateOf(false) }
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) sharing = true
+    }
+    LaunchedEffect(sharing) {
+        if (!sharing) return@LaunchedEffect
+        val mgr = ctx.getSystemService(android.location.LocationManager::class.java) ?: run {
+            sharing = false
+            return@LaunchedEffect
+        }
+        val until = System.currentTimeMillis() + 15 * 60 * 1000
+        var lastSent = 0L
+        val listener = object : android.location.LocationListener {
+            override fun onLocationChanged(loc: android.location.Location) {
+                val now = System.currentTimeMillis()
+                if (now > until) {
+                    sharing = false
+                    return
+                }
+                if (now - lastSent < 15_000L) return
+                lastSent = now
+                scope.launch {
+                    withContext(Dispatchers.IO) { session.sendLocation(peer, loc.latitude, loc.longitude, until) }
+                    bump()
+                }
+            }
+        }
+        val provider = listOf(
+            android.location.LocationManager.GPS_PROVIDER,
+            android.location.LocationManager.NETWORK_PROVIDER,
+        ).firstOrNull { mgr.allProviders.contains(it) }
+        if (provider == null) {
+            sharing = false
+            return@LaunchedEffect
+        }
+        try {
+            mgr.getLastKnownLocation(provider)?.let { listener.onLocationChanged(it) }
+            mgr.requestLocationUpdates(provider, 20_000L, 0f, listener, android.os.Looper.getMainLooper())
+            delay((until - System.currentTimeMillis()).coerceAtLeast(0L))
+        } catch (_: SecurityException) {
+        } finally {
+            runCatching { mgr.removeUpdates(listener) }
+            sharing = false
+        }
+    }
+    TextButton(onClick = {
+        if (sharing) {
+            sharing = false
+            return@TextButton
+        }
+        val fine = android.Manifest.permission.ACCESS_FINE_LOCATION
+        if (ctx.checkSelfPermission(fine) == android.content.pm.PackageManager.PERMISSION_GRANTED) sharing = true
+        else ask.launch(fine)
+    }) { Text(if (sharing) "Stop live location" else "Live location", color = Amber, fontSize = 12.sp) }
+    if (sharing) Text("Sharing this chat for 15 minutes. It stops when you leave or tap Stop. Location is not sent in the background.", color = Mute, fontSize = 12.sp)
+}
+
+@Composable
+fun ChannelsBlock(session: Session, bump: () -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var post by remember { mutableStateOf("") }
+    var rooms by remember { mutableStateOf(org.json.JSONArray()) }
+    var open by remember { mutableStateOf<String?>(null) }
+    var posts by remember { mutableStateOf(org.json.JSONArray()) }
+    var err by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        try { rooms = withContext(Dispatchers.IO) { session.channelNames() } } catch (e: Exception) { err = e.message ?: "channels failed" }
+    }
+    Text("A public channel is readable by any Bleep account. The relay stores the text in the clear.", color = Mute, fontSize = 12.sp)
+    Field("Channel name", name) { name = it }
+    TextButton(onClick = {
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { session.createChannel(name.trim()) }
+                name = ""
+                rooms = withContext(Dispatchers.IO) { session.channelNames() }
+                bump()
+            } catch (e: Exception) { err = e.message ?: "channel failed" }
+        }
+    }) { Text("Create channel", color = Amber) }
+    for (i in 0 until rooms.length()) {
+        val row = rooms.getJSONObject(i)
+        Text(row.optString("name"), color = TextC, modifier = Modifier.clickable {
+            open = row.optString("id")
+            scope.launch {
+                try { posts = withContext(Dispatchers.IO) { session.channelPosts(open!!) } } catch (e: Exception) { err = e.message ?: "posts failed" }
+            }
+        }.padding(vertical = 8.dp))
+    }
+    if (open != null) {
+        for (i in 0 until posts.length()) {
+            val p = posts.getJSONObject(i)
+            Text(p.optString("name") + " " + p.optString("text"), color = TextC, fontSize = 13.sp)
+        }
+        Field("Post", post) { post = it }
+        TextButton(onClick = {
+            val id = open ?: return@TextButton
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) { session.postChannel(id, post.trim()) }
+                    post = ""
+                    posts = withContext(Dispatchers.IO) { session.channelPosts(id) }
+                } catch (e: Exception) { err = e.message ?: "post failed" }
+            }
+        }) { Text("Post", color = Amber) }
+    }
+    if (err.isNotEmpty()) Text(err, color = Bad)
+}
+
+fun preciseSeen(iso: String): String = try {
+    val odt = java.time.OffsetDateTime.parse(iso)
+    odt.atZoneSameInstant(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+} catch (_: Exception) {
+    iso
 }
 
 fun chatName(p: Peer) = p.nickname?.takeIf { it.isNotBlank() } ?: p.displayName

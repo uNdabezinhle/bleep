@@ -55,6 +55,16 @@ class Relay(var base: String = "http://10.0.2.2:8090") {
         if (ttlSeconds != null) body.put("ttl_seconds", ttlSeconds)
         return req("POST", "/v1/mail", body, token)
     }
+    fun presence(token: String, ids: List<String>): JSONObject {
+        val q = ids.take(30).joinToString("&") { "mailbox_id=" + java.net.URLEncoder.encode(it, "UTF-8") }
+        return req("GET", "/v1/presence?$q", token = token)
+    }
+    fun channels(token: String): JSONObject = req("GET", "/v1/channels", token = token)
+    fun createChannel(token: String, name: String): JSONObject =
+        req("POST", "/v1/channels", JSONObject().put("name", name), token)
+    fun channelPosts(token: String, id: String): JSONObject = req("GET", "/v1/channels/$id/posts", token = token)
+    fun postChannel(token: String, id: String, text: String, name: String): JSONObject =
+        req("POST", "/v1/channels/$id/posts", JSONObject().put("text", text).put("name", name), token)
     fun fetch(token: String): JSONArray {
         val r = req("GET", "/v1/mail", token = token)
         return r.optJSONArray("items") ?: JSONArray()

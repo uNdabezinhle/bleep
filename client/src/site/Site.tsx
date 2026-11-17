@@ -7,6 +7,7 @@ const LINKS = [
   ["/about", "About"],
   ["/faq", "FAQ"],
   ["/contact", "Contact"],
+  ["/signin", "Sign in"],
   ["/register", "Register"],
 ] as const;
 
@@ -56,7 +57,8 @@ function Home() {
           A Bleep ID is made on the device. Email is the login. The relay holds sealed envelopes for a short time, and a sealed copy of history until unlink. It does not keep a plaintext transcript.
         </p>
         <div className="hero-actions">
-          <a className="accent-link" href="/register" onClick={onSiteClick}>Create an account</a>
+          <a className="accent-link" href="/signin" onClick={onSiteClick}>Sign in</a>
+          <a className="quiet-link" href="/register" onClick={onSiteClick}>Create an account</a>
           <a className="quiet-link" href="/hashes.html">Download the Android APK</a>
         </div>
       </section>
@@ -102,7 +104,7 @@ function Faq() {
     ["Do I need a phone number?", "No. Signup uses an email and a password. The key is still made on the device. The recovery code is not sent to the relay."],
     ["Can a stranger message me?", "They can send a request if they have your code. A thread opens after you accept."],
     ["Is the download the Play Store app?", "No. The file on the hash page is a debug-signed APK for this box, with its SHA-256 beside it. It is not a Play release and it is not an audit."],
-    ["Can people screenshot a chat?", "Yes. View-once and Chambers tell you that capture is still possible. The app does not claim it can stop a photograph of the screen."],
+    ["Can people screenshot a chat?", "The Android app blocks the system screenshot and screen recording while it is open. A photograph of the screen still works. The browser cannot stop a screenshot. View-once and Chambers say the same."],
     ["Where does a message live?", "On the devices in the conversation, and in a sealed history blob for the account until unlink. The relay cannot read that blob. Transport envelopes expire."],
     ["What is a Chamber?", "A separate ID, its own PIN, and a burn date. Unlocking Bleep does not unlock a Chamber."],
     ["Is there an iPhone app?", "No. There is no iOS build. Apple signing would need a Mac, and this tree does not have one."],

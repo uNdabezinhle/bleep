@@ -38,6 +38,8 @@ class RegisterIn(BaseModel):
     signed_prekey: SignedPrekeyIn
     one_time_prekeys: list[PrekeyIn] = Field(default_factory=list, max_length=100)
     registration_sig_b64: str
+    identity_mlkem_b64: str | None = None
+    mlkem_sig_b64: str | None = None
 
 
 class PrekeyBundleOut(BaseModel):
@@ -46,6 +48,7 @@ class PrekeyBundleOut(BaseModel):
     identity_x25519_b64: str
     signed_prekey: SignedPrekeyIn
     one_time_prekey: PrekeyIn | None = None
+    identity_mlkem_b64: str | None = None
 
 
 class DropIn(BaseModel):
