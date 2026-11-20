@@ -37,6 +37,8 @@ services:
       BLEEP_VAPID_PUBLIC: ${BLEEP_VAPID_PUBLIC:-}
       BLEEP_VAPID_PRIVATE: ${BLEEP_VAPID_PRIVATE:-}
       BLEEP_VAPID_SUB: ${BLEEP_VAPID_SUB:-mailto:hello@bleep.de5.net}
+      TURN_USER: ${TURN_USER:-bleep}
+      TURN_PASS: ${TURN_PASS:-bleep-dev}
     depends_on:
       postgres:
         condition: service_healthy

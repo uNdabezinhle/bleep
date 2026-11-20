@@ -140,6 +140,15 @@ async def region():
     return {"region": settings.bleep_region, "fail_closed": True}
 
 
+@app.get("/v1/turn")
+async def turn_login(
+    _principal: Principal = Depends(require_mailbox),
+    _region: str = Depends(require_region),
+):
+    # Same login the website bakes in at build time. No name is attached.
+    return {"username": settings.turn_user, "credential": settings.turn_pass, "port": 3478}
+
+
 @app.get("/v1/auth/challenge", response_model=ChallengeOut)
 async def challenge(_region: str = Depends(require_region)):
     return ChallengeOut(nonce=issue_challenge(), region=settings.bleep_region)

@@ -2,6 +2,7 @@ package za.bleep.personal.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaRecorder
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -44,6 +46,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
@@ -67,6 +71,9 @@ import za.bleep.personal.protocol.Hit
 import za.bleep.personal.protocol.Peer
 import za.bleep.personal.protocol.REGION
 import za.bleep.personal.protocol.Session
+import org.webrtc.EglBase
+import org.webrtc.SurfaceViewRenderer
+import org.webrtc.VideoTrack
 import java.io.File
 
 private val Ink = Color(0xFF101114)
@@ -124,6 +131,42 @@ fun BleepRoot(app: BleepApp) {
         }
     }
 
+    val call = remember { PhoneCall(ctx.applicationContext, session) }
+    DisposableEffect(session) {
+        session.onCall = { who, payload -> call.onSignal(who, payload) }
+        onDispose {
+            session.onCall = null
+            call.hangup()
+        }
+    }
+    var pendingCall by remember { mutableStateOf<Triple<Peer, String, Boolean>?>(null) }
+    val askCall = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val job = pendingCall
+        pendingCall = null
+        if (job == null) return@rememberLauncherForActivityResult
+        val (who, kind, answering) = job
+        val micOk = result[Manifest.permission.RECORD_AUDIO] == true
+        val camOk = kind != "video" || result[Manifest.permission.CAMERA] == true
+        if (!micOk || !camOk) {
+            call.error = "The microphone stays off until you allow it."
+            return@rememberLauncherForActivityResult
+        }
+        if (answering) call.accept() else call.start(who, kind)
+    }
+    fun beginCall(who: Peer, kind: String, answering: Boolean) {
+        val needCam = kind == "video"
+        val micOk = ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val camOk = !needCam || ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (micOk && camOk) {
+            if (answering) call.accept() else call.start(who, kind)
+        } else {
+            pendingCall = Triple(who, kind, answering)
+            askCall.launch(
+                if (needCam) arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+                else arrayOf(Manifest.permission.RECORD_AUDIO),
+            )
+        }
+    }
     Column(
         Modifier.fillMaxSize().background(Ink).pointerInput(Unit) {
             detectTapGestures { lastTouch = System.currentTimeMillis() }
@@ -136,6 +179,8 @@ fun BleepRoot(app: BleepApp) {
             Text("BLEEP · personal", color = Amber, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
             Text(REGION.replace("-", " · "), color = Amber, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
         }
+        if (call.phase != "idle") CallSheet(call, { beginCall(it, call.media, true) }, { call.hangup() })
+        if (call.error.isNotBlank() && call.phase == "idle") Text(call.error, color = Bad, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp))
         when (gate) {
             "setup" -> AccountPane(session, err) { p ->
                 pin = p
@@ -167,7 +212,8 @@ fun BleepRoot(app: BleepApp) {
                     }
                 }
             }
-            "app" -> AppPane(session, tick, { persist() }, { gate = "lock" }, { pin = it }, {
+            "app" -> AppPane(session, tick, { persist() }, { gate = "lock" }, { pin = it }, { who, kind -> beginCall(who, kind, false) }, {
+                call.hangup()
                 session.listenBackground = false
                 ListenService.stop(ctx)
                 app.live = null
@@ -343,7 +389,7 @@ fun LockPane(err: String, onUnlock: (String) -> Unit) {
 }
 
 @Composable
-fun AppPane(session: Session, tick: Int, bump: () -> Unit, onLock: () -> Unit, onPin: (String) -> Unit, onErased: () -> Unit) {
+fun AppPane(session: Session, tick: Int, bump: () -> Unit, onLock: () -> Unit, onPin: (String) -> Unit, onStartCall: (Peer, String) -> Unit, onErased: () -> Unit) {
     var tab by remember { mutableStateOf("me") }
     var peer by remember { mutableStateOf<Peer?>(null) }
     var groupId by remember { mutableStateOf<String?>(null) }
@@ -404,9 +450,16 @@ fun AppPane(session: Session, tick: Int, bump: () -> Unit, onLock: () -> Unit, o
                 chamberId,
                 { chamberId = it; peer = null; groupId = null },
                 { peer = null; groupId = null; chamberId = null },
+                onStartCall,
             )
             tab == "me" -> MePane(session, bump, onPin, onErased)
-            tab == "requests" -> RequestsPane(session, bump, { groupId = it; tab = "chats" }) { chamberId = it; tab = "chats" }
+            tab == "requests" -> RequestsPane(
+                session,
+                bump,
+                { groupId = it; tab = "chats" },
+                { chamberId = it; tab = "chats" },
+                { id -> peer = session.peers[id]; tab = "chats" },
+            )
             tab == "report" -> GuardianReport(session, bump, { tab = "me" }, { tab = "chats" })
             else -> ChatsPane(
                 session,
@@ -826,6 +879,7 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
                         )
                         withContext(Dispatchers.IO) { session.sendIntro(p, hello) }
                         bump()
+                        open(p)
                     } catch (e: Exception) {
                         err = e.message ?: "failed"
                     }
@@ -838,12 +892,14 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
         AmberButton("Send request") {
             scope.launch {
                 try {
-                    withContext(Dispatchers.IO) {
-                        val p = session.addByCode(code)
-                        session.sendIntro(p, hello)
+                    val p = withContext(Dispatchers.IO) {
+                        val added = session.addByCode(code)
+                        session.sendIntro(added, hello)
+                        added
                     }
                     code = ""
                     bump()
+                    open(p)
                 } catch (e: Exception) {
                     err = e.message ?: "failed"
                 }
@@ -932,13 +988,20 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
 }
 
 @Composable
-fun RequestsPane(session: Session, bump: () -> Unit, onJoined: (String) -> Unit, onChamber: (String) -> Unit) {
+fun RequestsPane(
+    session: Session,
+    bump: () -> Unit,
+    onJoined: (String) -> Unit,
+    onChamber: (String) -> Unit,
+    onOpen: (String) -> Unit,
+) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (session.requests.isEmpty() && session.peers.values.none { !it.accepted }) Text("No requests.", color = Mute)
         session.requests.forEach { req ->
             val who = session.peers[req.peerId]?.displayName ?: "Request"
             if (!req.groupId.isNullOrBlank()) {
                 Text("$who invited you to ${req.groupName ?: "a group"}. Join is explicit.", color = TextC)
+                if (req.text.isNotBlank()) Text(req.text, color = Mute, fontSize = 13.sp)
                 AmberButton("Join") {
                     session.acceptGroup(req.peerId, req.groupId, req.groupName ?: "Group")
                     bump()
@@ -946,6 +1009,7 @@ fun RequestsPane(session: Session, bump: () -> Unit, onJoined: (String) -> Unit,
                 }
             } else if (req.chamberInvite) {
                 Text("$who wants a chamber. Both of you accept. Screenshots are not ours to delete.", color = TextC)
+                if (req.text.isNotBlank()) Text(req.text, color = Mute, fontSize = 13.sp)
                 AmberButton("Accept chamber") {
                     session.acceptChamber(req.peerId, req.burnAt)
                     bump()
@@ -956,15 +1020,25 @@ fun RequestsPane(session: Session, bump: () -> Unit, onJoined: (String) -> Unit,
         session.peers.values.filter { peer ->
             !peer.accepted && session.requests.any { it.peerId == peer.mailboxId && it.groupId.isNullOrBlank() && !it.chamberInvite }
         }.forEach { p ->
-            Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            val hello = session.requests.lastOrNull { it.peerId == p.mailboxId && it.groupId.isNullOrBlank() && !it.chamberInvite }?.text
+            Column(Modifier.fillMaxWidth().padding(8.dp)) {
                 Text(p.displayName, color = TextC)
-                AmberButton("Accept") { session.accept(p.mailboxId); bump() }
+                Text(hello?.ifBlank { null } ?: "Request to message", color = Mute, fontSize = 13.sp)
+                AmberButton("Accept") {
+                    session.accept(p.mailboxId)
+                    bump()
+                    onOpen(p.mailboxId)
+                }
             }
         }
         session.peers.values.filter { peer -> !peer.accepted && session.requests.none { it.peerId == peer.mailboxId } }.forEach { p ->
             Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(p.displayName, color = TextC)
-                AmberButton("Accept") { session.accept(p.mailboxId); bump() }
+                AmberButton("Accept") {
+                    session.accept(p.mailboxId)
+                    bump()
+                    onOpen(p.mailboxId)
+                }
             }
         }
     }
@@ -979,6 +1053,7 @@ fun ThreadPane(
     chamberId: String? = null,
     onOpenChamber: (String) -> Unit = {},
     onClose: () -> Unit = {},
+    onStartCall: (Peer, String) -> Unit = { _, _ -> },
 ) {
     var text by remember { mutableStateOf("") }
     var hits by remember { mutableStateOf<List<Hit>>(emptyList()) }
@@ -1149,6 +1224,8 @@ fun ThreadPane(
         Text("The system screenshot is blocked while Bleep is open. A photograph of the screen still works.", color = Mute, fontSize = 12.sp)
         Row {
             if (dm && peer != null) {
+                TextButton(onClick = { onStartCall(peer, "audio") }) { Text("Call", color = Amber, fontSize = 12.sp) }
+                TextButton(onClick = { onStartCall(peer, "video") }) { Text("Video", color = Amber, fontSize = 12.sp) }
                 TextButton(onClick = { session.verifyPeer(peer); bump() }) { Text("Mark verified", color = Amber, fontSize = 12.sp) }
                 TextButton(onClick = {
                     peer.disappearSec = nextDisappearSec(peer.disappearSec)
@@ -1635,6 +1712,64 @@ fun preciseSeen(iso: String): String = try {
 }
 
 fun chatName(p: Peer) = p.nickname?.takeIf { it.isNotBlank() } ?: p.displayName
+
+@Composable
+private fun CallSheet(call: PhoneCall, onAnswer: (Peer) -> Unit, onHangup: () -> Unit) {
+    val who = call.peer
+    val title = when (call.phase) {
+        "active" -> "In call"
+        "ringing-in" -> "Incoming call"
+        else -> "Calling…"
+    }
+    Column(Modifier.fillMaxWidth().padding(12.dp).background(Paper, RoundedCornerShape(12.dp)).padding(12.dp)) {
+        Text(title, color = TextC, fontSize = 18.sp)
+        Text(chatName(who ?: return), color = Mute, fontSize = 13.sp)
+        Text("Signalling is sealed. TURN never sees a name. The call stays while Bleep is open.", color = Mute, fontSize = 12.sp)
+        if (call.media == "video") {
+            val egl = call.egl()
+            val remote = call.remoteTrack
+            val local = call.localTrack
+            if (egl != null && remote != null) CallVideo(remote, egl, mirror = false, Modifier.fillMaxWidth().height(220.dp))
+            if (egl != null && local != null) CallVideo(local, egl, mirror = true, Modifier.fillMaxWidth().height(120.dp))
+        }
+        if (call.error.isNotBlank()) Text(call.error, color = Bad, fontSize = 13.sp)
+        Row {
+            if (call.phase == "ringing-in" && who != null) {
+                TextButton(onClick = { onAnswer(who) }) { Text("Answer", color = Amber) }
+            }
+            TextButton(onClick = onHangup) {
+                Text(if (call.phase == "ringing-in") "Decline" else "Hang up", color = Bad)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CallVideo(track: VideoTrack, egl: EglBase, mirror: Boolean, modifier: Modifier) {
+    var view by remember { mutableStateOf<SurfaceViewRenderer?>(null) }
+    AndroidView(
+        factory = { ctx ->
+            SurfaceViewRenderer(ctx).apply {
+                init(egl.eglBaseContext, null)
+                setMirror(mirror)
+                setEnableHardwareScaler(true)
+                view = this
+            }
+        },
+        modifier = modifier,
+        onRelease = { renderer ->
+            view = null
+            renderer.release()
+        },
+    )
+    DisposableEffect(track, view) {
+        val renderer = view
+        if (renderer != null) track.addSink(renderer)
+        onDispose {
+            if (renderer != null) track.removeSink(renderer)
+        }
+    }
+}
 
 fun replyLine(m: ChatMsg): String {
     val t = m.text.trim()

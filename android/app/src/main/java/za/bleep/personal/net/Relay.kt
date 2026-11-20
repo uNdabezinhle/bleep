@@ -47,6 +47,7 @@ class Relay(var base: String = "http://10.0.2.2:8090") {
     }
 
     fun health(): JSONObject = req("GET", "/v1/health")
+    fun turn(token: String): JSONObject = req("GET", "/v1/turn", token = token)
     fun challenge(): JSONObject = req("GET", "/v1/auth/challenge")
     fun register(body: JSONObject): JSONObject = req("POST", "/v1/mailboxes", body)
     fun token(body: JSONObject): JSONObject = req("POST", "/v1/auth/token", body)

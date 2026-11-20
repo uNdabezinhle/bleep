@@ -46,6 +46,14 @@ envelope after the signature checks and the ratchet opens. If the ratchet
 does not open, the envelope stays until a device that can open it acks it,
 or until the TTL sweep. There is still no sender column.
 
+A 1:1 call is a sealed payload `kind=call`. `phase` is `offer`, `answer`,
+`ice`, `hangup`, or `missed`. The SDP and the ICE candidate are inside that
+payload. The relay cannot read them. TURN is that box on port 3478.
+A signed-in phone asks `GET /v1/turn` for the user and password. The
+website still receives those from its build. TURN does not receive a name. A group, a chamber, and a public channel have no
+call. The call runs while that Bleep process is open.
+A missed call is a thread row whose text is `Missed call`.
+
 ## Account, devices, history, directory
 
 The relay stores the normalized email, an Argon2id verifier, one mailbox id,

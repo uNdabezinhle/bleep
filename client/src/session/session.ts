@@ -182,37 +182,44 @@ export async function sendSealed(
   payload: Payload,
   opts: { ttl?: number; spk?: SpkHold; opkMap?: Map<number, OpkHold> } = {},
 ): Promise<void> {
-  const st = await ensureAliceSession(snap, token, peer, opts.spk ?? { id: 1, sk: snap.identity.xSk, pk: snap.identity.xPk });
-  const rec = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
-  const { header, ciphertext } = ratchetEncrypt(st, encodePt(payload));
-  putRatchet(snap, peer.mailboxId, st, rec);
-  const stored = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
-  const isPk = Boolean(stored.pendingEphSk);
-  const inner = signInner(snap.identity, {
-    v: 1,
-    t: payload.kind === "intro" ? "intro" : isPk ? "pkmsg" : "msg",
-    sid: b64e(snap.identity.edPk),
-    spk: b64e(snap.identity.xPk),
-    mid: snap.identity.mailboxId,
-    ek: stored.ephPk,
-    used_opk: stored.pendingOpkId,
-    used_spk: stored.pendingSpkId,
-    pq: isPk ? stored.pqCt : undefined,
-    h: header,
-    ct: b64e(ciphertext),
-    ts: Date.now(),
-  });
-  if (isPk) {
-    stored.pendingEphSk = undefined;
-    stored.ephPk = undefined;
-    stored.pqCt = undefined;
+  const wasEstablished = Boolean(snap.sessions[peer.mailboxId]?.established);
+  try {
+    const st = await ensureAliceSession(snap, token, peer, opts.spk ?? { id: 1, sk: snap.identity.xSk, pk: snap.identity.xPk });
+    const rec = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
+    const { header, ciphertext } = ratchetEncrypt(st, encodePt(payload));
+    putRatchet(snap, peer.mailboxId, st, rec);
+    const stored = snap.sessions[peer.mailboxId] as SessionRec & { ephPk?: string };
+    const isPk = Boolean(stored.pendingEphSk);
+    const inner = signInner(snap.identity, {
+      v: 1,
+      t: payload.kind === "intro" ? "intro" : isPk ? "pkmsg" : "msg",
+      sid: b64e(snap.identity.edPk),
+      spk: b64e(snap.identity.xPk),
+      mid: snap.identity.mailboxId,
+      ek: stored.ephPk,
+      used_opk: stored.pendingOpkId,
+      used_spk: stored.pendingSpkId,
+      pq: isPk ? stored.pqCt : undefined,
+      h: header,
+      ct: b64e(ciphertext),
+      ts: Date.now(),
+    });
+    if (isPk) {
+      stored.pendingEphSk = undefined;
+      stored.ephPk = undefined;
+      stored.pqCt = undefined;
+    }
+    const blob = sealOuter(b64d(peer.xPk), encodeInner(inner));
+    await api.drop(token, {
+      dest_mailbox_id: peer.mailboxId,
+      blob_b64: b64e(blob),
+      ttl_seconds: opts.ttl ?? 36 * 3600,
+    });
+  } catch (err) {
+    // A failed first drop must not keep a session that can no longer introduce.
+    if (!wasEstablished) delete snap.sessions[peer.mailboxId];
+    throw err;
   }
-  const blob = sealOuter(b64d(peer.xPk), encodeInner(inner));
-  await api.drop(token, {
-    dest_mailbox_id: peer.mailboxId,
-    blob_b64: b64e(blob),
-    ttl_seconds: opts.ttl ?? 36 * 3600,
-  });
 }
 
 export type Incoming = {

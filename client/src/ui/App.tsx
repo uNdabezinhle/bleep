@@ -289,7 +289,10 @@ export function App({ path = "/app" }: { path?: string }) {
             {tab === "requests" && (
               <div className="pane">
                 <h1 className="pane-title">Requests</h1>
-                <Requests onJoined={(id) => { setTab("chats"); setListMode("groups"); setThreadId(id); }} />
+                <Requests
+                  onAccepted={(id) => { setTab("chats"); setListMode("chats"); setThreadId(id); }}
+                  onJoined={(id) => { setTab("chats"); setListMode("groups"); setThreadId(id); }}
+                />
               </div>
             )}
             {tab === "status" && <div className="pane"><h1 className="pane-title">Status</h1><StatusPane /></div>}
@@ -320,7 +323,11 @@ export function App({ path = "/app" }: { path?: string }) {
         )}
       </div>
       {addOpen && (
-        <AddPerson onClose={() => setAddOpen(false)} onGroup={() => { setAddOpen(false); setGroupOpen(true); }} />
+        <AddPerson
+          onClose={() => setAddOpen(false)}
+          onGroup={() => { setAddOpen(false); setGroupOpen(true); }}
+          onSent={(id) => { setAddOpen(false); setTab("chats"); setListMode("chats"); setThreadId(id); }}
+        />
       )}
       {groupOpen && (
         <NewGroup
@@ -1252,7 +1259,7 @@ function SafetyMenu({ thread, peer, nick, onNick, onDone }: { thread: Thread; pe
   );
 }
 
-function Requests({ onJoined }: { onJoined: (threadId: string) => void }) {
+function Requests({ onAccepted, onJoined }: { onAccepted: (threadId: string) => void; onJoined: (threadId: string) => void }) {
   const snap = rt.snap!;
   if (snap.requests.length === 0) return <div className="empty">No requests. Unknown Bleep codes cannot dump a thread into your inbox.</div>;
   const grouped = new Map<string, typeof snap.requests>();
@@ -1264,6 +1271,7 @@ function Requests({ onJoined }: { onJoined: (threadId: string) => void }) {
     <div className="list">
       {[...grouped.entries()].map(([mid, msgs]) => {
         const peer = snap.peers[mid];
+        const hello = [...msgs].reverse().find((m) => m.text)?.text;
         return (
           <div key={mid} className="row" style={{ gridTemplateColumns: "40px 1fr" }}>
             <Face id={peer?.avatarId} letter={peer?.displayName || "?"} />
@@ -1272,7 +1280,9 @@ function Requests({ onJoined }: { onJoined: (threadId: string) => void }) {
               <div className="preview">
                 {msgs.some((m) => m.chamberInvite)
                   ? "Chamber invite — both of you must accept. Screenshots are not ours to delete."
-                  : "Request to message — accept before a thread opens."}
+                  : msgs.some((m) => m.groupId)
+                  ? hello || "Group invite. Join is explicit."
+                  : hello || "Request to message — accept before a thread opens."}
               </div>
               <div className="actions">
                 <button onClick={() => rt.declineRequest(mid)}>Decline</button>
@@ -1292,7 +1302,7 @@ function Requests({ onJoined }: { onJoined: (threadId: string) => void }) {
                     Join group
                   </button>
                 ) : (
-                  <button className="go" onClick={() => rt.acceptRequest(mid)}>Accept</button>
+                  <button className="go" onClick={() => { const id = rt.acceptRequest(mid); if (id) onAccepted(id); }}>Accept</button>
                 )}
               </div>
             </div>
@@ -1750,7 +1760,7 @@ function NewGroup({ onClose, onCreated }: { onClose: () => void; onCreated: (thr
   );
 }
 
-function AddPerson({ onClose, onGroup }: { onClose: () => void; onGroup: () => void }) {
+function AddPerson({ onClose, onGroup, onSent }: { onClose: () => void; onGroup: () => void; onSent: (threadId: string) => void }) {
   const [code, setCode] = useState("");
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<{ handle: string }[]>([]);
@@ -1842,8 +1852,8 @@ function AddPerson({ onClose, onGroup }: { onClose: () => void; onGroup: () => v
             onClick={async () => {
               try {
                 const peer = await rt.addByCode(code.trim());
-                await rt.sendRequest(peer, hello);
-                onClose();
+                const threadId = await rt.sendRequest(peer, hello);
+                onSent(threadId);
               } catch (e) {
                 setErr((e as Error).message);
               }

@@ -33,6 +33,19 @@ def register(c: TestClient):
     return {**body, **r.json(), "_kp": kp}
 
 
+def test_turn_login_needs_a_mailbox():
+    with client() as c:
+        anon = c.get("/v1/turn", headers=HDR)
+        assert anon.status_code == 401
+        box = register(c)
+        r = c.get("/v1/turn", headers={**HDR, "Authorization": f"Bearer {box['token']}"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["username"] == "bleep"
+        assert body["port"] == 3478
+        assert isinstance(body["credential"], str) and body["credential"]
+
+
 def test_health_region():
     with client() as c:
         r = c.get("/v1/health", headers=HDR)

@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     bleep_vapid_public: str = ""
     bleep_vapid_private: str = ""
     bleep_vapid_sub: str = "mailto:hello@bleep.de5.net"
+    turn_user: str = "bleep"
+    turn_pass: str = "bleep-dev"
 
 
 settings = Settings()

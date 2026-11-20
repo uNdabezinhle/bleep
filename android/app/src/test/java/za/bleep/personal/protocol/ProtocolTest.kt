@@ -37,6 +37,23 @@ class ProtocolTest {
     }
 
     @Test
+    fun callIceUsesTheBoxAndNotAPublicStun() {
+        assertEquals("bleep.de5.net", CallIce.hostOf("https://bleep.de5.net"))
+        assertEquals("10.0.2.2", CallIce.hostOf("http://10.0.2.2:8090/"))
+        val urls = CallIce.urls("https://bleep.de5.net")
+        assertTrue(urls.any { it == "stun:bleep.de5.net:3478" })
+        assertTrue(urls.any { it == "turn:bleep.de5.net:3478?transport=udp" })
+        assertTrue(urls.any { it == "turn:bleep.de5.net:3478?transport=tcp" })
+        assertFalse(urls.any { it.contains("google") })
+        val raw = CallIce.candidateJson("0", 1, "candidate:1 1 UDP 1 1.2.3.4 9 typ host")
+        val parsed = CallIce.parseCandidate(raw)
+        assertEquals("0", parsed!!.first)
+        assertEquals(1, parsed.second)
+        assertEquals("candidate:1 1 UDP 1 1.2.3.4 9 typ host", parsed.third)
+        assertEquals(null, CallIce.parseCandidate("not-json"))
+    }
+
+    @Test
     fun saIdPassingChecksumWarns() {
         assertTrue(Guardian.validSaId("9001015800088"))
         assertTrue(Guardian.scan("here is 9001015800088 for FICA").any { it.rule == "sa-id" })

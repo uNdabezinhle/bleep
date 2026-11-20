@@ -16,6 +16,7 @@ import { api, wakeUrl, RegionMismatch } from "./net/api";
 import { inspectDraft, type Hit } from "./guardian/engine";
 import {
   appendMsg,
+  dmThreadId,
   ensureDmThread,
   login,
   makePrekeys,
@@ -430,7 +431,6 @@ export class Runtime {
         this.lockNow();
         return;
       }
-      if (opts?.rethrowConflict) throw e;
     }
   }
 
@@ -1247,34 +1247,47 @@ export class Runtime {
     return peer;
   }
 
-  async sendRequest(peer: Peer, hello: string): Promise<void> {
-    if (!this.snap || !this.token) return;
+  async sendRequest(peer: Peer, hello: string): Promise<string> {
+    if (!this.snap || !this.token) throw new Error("locked");
+    const id = crypto.randomUUID();
     await this.seal(peer, {
       kind: "intro",
-      id: crypto.randomUUID(),
+      id,
       text: hello,
       displayName: this.snap.identity.displayName,
       handle: publishedHandle(this.snap.settings.handle) || undefined,
-    });
+    }, { freshIntro: true });
     const stored = this.snap.peers[peer.mailboxId] ?? peer;
     stored.accepted = true;
+    const th = ensureDmThread(this.snap, stored);
+    appendMsg(this.snap, {
+      id,
+      threadId: th.id,
+      fromMe: true,
+      kind: "text",
+      text: hello,
+      at: Date.now(),
+      status: "sent",
+    });
     void this.shareProfileWith(stored).catch(() => undefined);
     this.bump();
+    return th.id;
   }
 
-  acceptRequest(fromMailbox: string): void {
-    if (!this.snap) return;
+  acceptRequest(fromMailbox: string): string | null {
+    if (!this.snap) return null;
     const peer = this.snap.peers[fromMailbox];
-    if (!peer) return;
+    if (!peer) return null;
     peer.accepted = true;
     const th = ensureDmThread(this.snap, peer);
-    const reqs = this.snap.requests.filter((r) => r.fromMailbox === fromMailbox);
-    this.snap.requests = this.snap.requests.filter((r) => r.fromMailbox !== fromMailbox);
+    const reqs = this.snap.requests.filter((r) => r.fromMailbox === fromMailbox && !r.groupId && !r.chamberInvite);
+    this.snap.requests = this.snap.requests.filter((r) => r.fromMailbox !== fromMailbox || r.groupId || r.chamberInvite);
     for (const r of reqs) {
       appendMsg(this.snap, { ...r, threadId: th.id });
     }
     void this.shareProfileWith(peer).catch(() => undefined);
     this.bump();
+    return th.id;
   }
 
   declineRequest(fromMailbox: string): void {
@@ -2106,11 +2119,23 @@ export class Runtime {
     this.snap!.sharedSessions = { ...(this.snap!.sharedSessions ?? {}), [peerId]: rec.ratchet };
   }
 
-  private async seal(peer: Peer, payload: Payload, opts?: { ttl?: number }): Promise<void> {
+  private async seal(peer: Peer, payload: Payload, opts?: { ttl?: number; freshIntro?: boolean }): Promise<void> {
     if (!this.snap || !this.token) return;
     for (let attempt = 0; attempt < 2; attempt++) {
-      await this.pullHistory();
+      try {
+        await this.pullHistory();
+      } catch (err) {
+        const msg = (err as Error).message || "";
+        if (msg.includes("erase")) throw err;
+      }
       if (!this.snap || !this.token) return;
+      if (opts?.freshIntro && attempt === 0) {
+        const threadId = dmThreadId(this.snap.identity.mailboxId, peer.mailboxId);
+        if ((this.snap.messages[threadId] ?? []).length === 0) {
+          delete this.snap.sessions[peer.mailboxId];
+          if (this.snap.sharedSessions) delete this.snap.sharedSessions[peer.mailboxId];
+        }
+      }
       const shared = this.snap.sharedSessions?.[peer.mailboxId];
       const live = Boolean(this.snap.sessions[peer.mailboxId]?.established);
       const choice = x3dhChoice(Boolean(shared && isRatchetDump(shared)), live);
