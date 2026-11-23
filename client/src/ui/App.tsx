@@ -4,6 +4,7 @@ import jsQR from "jsqr";
 import { api } from "../net/api";
 import { rt } from "./instance";
 import { disappearAction, disappearPhrase, muteAction, replySnippet } from "../chat/prefs";
+import { clockOfMinutes, minutesOfClock, tally } from "../special/features";
 import { bleepCode, formatRecovery, formatShortId, freshRecoverySeed } from "../protocol/keys";
 import { pairSafety } from "../session/session";
 import { navigate } from "../site/router";
@@ -117,6 +118,7 @@ export function App({ path = "/app" }: { path?: string }) {
   const [gate, setGate] = useState<Gate>("boot");
   const [tab, setTab] = useState<Tab>("chats");
   const [listMode, setListMode] = useState<"chats" | "chambers" | "groups" | "channels">("chats");
+  const [starsOnly, setStarsOnly] = useState(false);
   const [leaveId, setLeaveId] = useState<string | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -183,6 +185,10 @@ export function App({ path = "/app" }: { path?: string }) {
     })
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.lastAt - a.lastAt);
   const thread = threadId ? snap.threads[threadId] : undefined;
+  const starredMsgs = Object.entries(snap.messages).flatMap(([id, list]) => {
+    if (id.startsWith("ch:") || snap.threads[id]?.kind === "chamber") return [];
+    return list.filter((m) => m.starred && !m.deleted);
+  }).sort((a, b) => b.at - a.at);
   const showList = tab === "chats" && !(narrow && thread);
   const showMain = !(narrow && tab === "chats" && !thread);
   const frame =
@@ -229,6 +235,7 @@ export function App({ path = "/app" }: { path?: string }) {
               <button className={listMode === "chambers" ? "on" : ""} onClick={() => { setListMode("chambers"); setThreadId(null); }}>Chambers</button>
               <button className={listMode === "groups" ? "on" : ""} onClick={() => { setListMode("groups"); setThreadId(null); }}>Groups</button>
               <button className={listMode === "channels" ? "on" : ""} onClick={() => { setListMode("channels"); setThreadId(null); }}>Channels</button>
+              <button className={starsOnly ? "on" : ""} onClick={() => setStarsOnly((v) => !v)}>Starred</button>
             </div>
             {listMode !== "chambers" && listMode !== "channels" && (
               <input
@@ -239,7 +246,17 @@ export function App({ path = "/app" }: { path?: string }) {
                 onChange={(e) => setFind(e.target.value)}
               />
             )}
-            {listMode === "channels" ? <ChannelsPane /> : <div className="list">
+            {listMode === "channels" ? <ChannelsPane /> : starsOnly ? <div className="list">
+              {starredMsgs.length === 0 && <div className="empty">No starred messages on this device.</div>}
+              {starredMsgs.map((m) => (
+                <button key={m.id} className="row" onClick={() => { setStarsOnly(false); setThreadId(m.threadId); }}>
+                  <div className="meta">
+                    <div className="name">{snap.threads[m.threadId]?.title || "Chat"}</div>
+                    <div className="preview">{m.kind === "poll" ? m.poll?.question || m.text : m.text}</div>
+                  </div>
+                </button>
+              ))}
+            </div> : <div className="list">
               {threads.length === 0 && (
                 <div className="empty">
                   {q
@@ -713,6 +730,11 @@ function ThreadView({
   const [menu, setMenu] = useState(false);
   const [leaveAsk, setLeaveAsk] = useState(false);
   const [mediaOpen, setMediaOpen] = useState(false);
+  const [laterOpen, setLaterOpen] = useState(false);
+  const [laterAt, setLaterAt] = useState("");
+  const [pollOpen, setPollOpen] = useState(false);
+  const [pollQ, setPollQ] = useState("");
+  const [pollOpts, setPollOpts] = useState(["", ""]);
   const [nick, setNick] = useState(peer?.nickname ?? "");
   const recRef = useRef<MediaRecorder | null>(null);
   const holdRef = useRef(false);
@@ -847,6 +869,9 @@ function ThreadView({
               const next = window.prompt("Edit (signed follow-up, not a relay history)", m.text);
               if (next != null) void rt.editMessage(thread, m, next);
             }}
+            onStar={() => rt.toggleStar(m)}
+            onVote={(option) => void rt.votePoll(thread, m.id, option)}
+            onClosePoll={() => void rt.closePollMessage(thread, m.id)}
           />
         ))}
         <div ref={end} />
@@ -947,7 +972,36 @@ function ThreadView({
           }}
         />
         <button className="iconbtn primary" aria-label="Send" onClick={() => void send()}><Icon d={ICON.send} /></button>
+        {(thread.kind === "dm" || thread.kind === "group") && (
+          <button type="button" className="ghost" onClick={() => setLaterOpen((v) => !v)}>Send later</button>
+        )}
+        {thread.kind === "group" && (
+          <button type="button" className="ghost" onClick={() => setPollOpen((v) => !v)}>Poll</button>
+        )}
       </div>}
+      {laterOpen && (thread.kind === "dm" || thread.kind === "group") && (
+        <div className="replybar">
+          <p className="note">Sends while Bleep is open on this device. If Bleep is closed, it sends the next time you open it. The relay does not see it early.</p>
+          <input type="datetime-local" value={laterAt} onChange={(e) => setLaterAt(e.target.value)} aria-label="Send at" />
+          <button type="button" className="ghost" onClick={() => {
+            const when = new Date(laterAt).getTime();
+            if (!text.trim() || !when || when <= Date.now()) return;
+            alert(rt.scheduleText(thread, text, when));
+            setText("");
+            setLaterOpen(false);
+          }}>Schedule</button>
+        </div>
+      )}
+      {pollOpen && thread.kind === "group" && (
+        <div className="replybar">
+          <input value={pollQ} onChange={(e) => setPollQ(e.target.value)} placeholder="Question" aria-label="Poll question" />
+          {pollOpts.map((opt, i) => (
+            <input key={i} value={opt} onChange={(e) => setPollOpts((prev) => prev.map((v, n) => n === i ? e.target.value : v))} placeholder={"Choice " + (i + 1)} aria-label={"Choice " + (i + 1)} />
+          ))}
+          {pollOpts.length < 4 && <button type="button" className="ghost" onClick={() => setPollOpts((prev) => [...prev, ""])}>Add choice</button>}
+          <button type="button" className="ghost" onClick={() => void rt.sendPoll(thread, pollQ, pollOpts).then(() => { setPollOpen(false); setPollQ(""); setPollOpts(["", ""]); }).catch((e) => alert((e as Error).message))}>Send poll</button>
+        </div>
+      )}
     </>
   );
 }
@@ -1082,7 +1136,7 @@ function CallOverlay() {
 }
 
 function Bubble({
-  msg, mine, onReply, onReact, onDel, onDelAll, onOpenHeld, onEdit,
+  msg, mine, onReply, onReact, onDel, onDelAll, onOpenHeld, onEdit, onStar, onVote, onClosePoll,
 }: {
   msg: Message;
   mine: boolean;
@@ -1092,6 +1146,9 @@ function Bubble({
   onDelAll: () => void;
   onOpenHeld: () => void;
   onEdit: () => void;
+  onStar: () => void;
+  onVote: (option: number) => void;
+  onClosePoll: () => void;
 }) {
   const onceHidden = Boolean(msg.viewOnce && !msg.viewed && !mine && !msg.deleted);
   const [url, setUrl] = useState<string | null>(null);
@@ -1151,7 +1208,19 @@ function Bubble({
               {!msg.needsDownload && msg.kind === "voice" && url && <audio controls src={url} style={{ width: "100%" }} />}
               {!msg.needsDownload && msg.kind === "file" && <div className="t">File: {msg.name}</div>}
               {msg.kind === "call" && <div className="t">☎ {msg.text}</div>}
-              {msg.text && msg.kind !== "call" && (
+              {msg.kind === "poll" && msg.poll && (
+                <div className="t">
+                  <div>{msg.poll.question}</div>
+                  {msg.poll.options.map((opt, i) => (
+                    <button key={i} type="button" className="ghost" disabled={msg.poll?.closed} onClick={() => onVote(i)}>
+                      {opt} · {tally(msg.poll!)[i]}
+                    </button>
+                  ))}
+                  <div className="note">Counts are what this device has opened.</div>
+                  {mine && !msg.poll.closed && <button type="button" className="ghost" onClick={onClosePoll}>Close poll</button>}
+                </div>
+              )}
+              {msg.text && msg.kind !== "call" && msg.kind !== "poll" && (
                 <div className="t" onDoubleClick={mine ? onEdit : undefined}>
                   {msg.text}
                   {msg.edited ? " (edited)" : ""}
@@ -1165,6 +1234,7 @@ function Bubble({
       )}
       <div className="at">
         {fmtTime(msg.at)} {msg.reacted ?? ""} <Receipt status={msg.status} />
+        <button className="iconbtn tiny" aria-label={msg.starred ? "Unstar" : "Star"} onClick={onStar}>{msg.starred ? "★" : "☆"}</button>
         <button className="iconbtn tiny" aria-label="Reply" onClick={onReply}>↩</button>
         <button className="iconbtn tiny" aria-label="React" onClick={() => onReact("👍")}>👍</button>
         <button className="iconbtn tiny" aria-label="Delete for me" title="Delete for me" onClick={onDel}>×</button>
@@ -1494,7 +1564,10 @@ function SettingsPane({ slide, onSlide, onErased }: { slide: number; onSlide: (i
           </div>
           <div>
             <h3>Background notice</h3>
-            <p className="note">The notice says Bleep. It does not include the message or the sender. The browser push service can see that a notice was sent. This box sends notices only after a push key is set.</p>
+            <p className="note">The notice says Bleep. It does not include the message or the sender. The browser push service can see that a notice was sent. This box sends notices only after a push key is set. A call rings on the phone while Bleep is listening. It does not ring after the app is stopped.</p>
+            <p className="note">Quiet hours mute the phone notice and the ring. Messages still arrive. These hours stay on this device. The website notice still arrives if this browser allowed it, because the box does not learn the hours.</p>
+            <label>Quiet from <input type="time" aria-label="Quiet from" value={clockOfMinutes(rt.snap?.quietStartMin)} onChange={(e) => { if (!rt.snap) return; rt.snap.quietStartMin = minutesOfClock(e.target.value); rt.bump(); }} /></label>
+            <label> until <input type="time" aria-label="Quiet until" value={clockOfMinutes(rt.snap?.quietEndMin)} onChange={(e) => { if (!rt.snap) return; rt.snap.quietEndMin = minutesOfClock(e.target.value); rt.bump(); }} /></label>
             <button type="button" className="ghost" onClick={() => void rt.enablePush().then((note) => alert(note)).catch((e) => alert((e as Error).message))}>
               Notify this browser
             </button>

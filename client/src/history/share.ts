@@ -1,5 +1,6 @@
 import { b64d } from "../protocol/bytes";
 import { dmThreadId } from "../session/session";
+import { mergePoll, mergeStar } from "../special/features";
 import type { GroupState, Message, Peer, Thread, VaultSnapshot } from "../types";
 
 export type LooseMsg = Message & { peerId?: string; bytesB64?: string; attachmentId?: string };
@@ -107,6 +108,7 @@ function mergeLists(local: Message[] | undefined, incoming: LooseMsg[], threadId
   for (const raw of incoming) {
     if (!raw?.id) continue;
     const msg = androidMessage(raw, threadId);
+    if (msg.deleted) msg.starred = false;
     const prev = byId.get(msg.id);
     byId.set(
       msg.id,
@@ -119,6 +121,8 @@ function mergeLists(local: Message[] | undefined, incoming: LooseMsg[], threadId
             needsDownload: prev.needsDownload,
             text: msg.deleted ? "" : msg.text || prev.text,
             deleted: Boolean(msg.deleted || prev.deleted),
+            starred: mergeStar(prev.starred, msg.starred, Boolean(msg.deleted || prev.deleted)),
+            poll: mergePoll(prev.poll, msg.poll),
           }
         : msg,
     );

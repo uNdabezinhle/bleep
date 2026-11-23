@@ -173,7 +173,10 @@ export type Payload =
   | { kind: "typing"; id: string }
   | { kind: "ctrl"; id: string; op: string; data?: unknown }
   | { kind: "call"; id: string; phase: "offer" | "answer" | "ice" | "hangup" | "missed"; sdp?: string; candidate?: string; media?: "audio" | "video" }
-  | { kind: "location"; id: string; text: string; lat: number; lon: number; until: number };
+  | { kind: "location"; id: string; text: string; lat: number; lon: number; until: number }
+  | { kind: "poll"; id: string; question: string; options: string[]; groupId: string }
+  | { kind: "vote"; id: string; pollId: string; option: number; groupId: string }
+  | { kind: "poll-close"; id: string; pollId: string; groupId: string };
 
 export async function sendSealed(
   snap: VaultSnapshot,

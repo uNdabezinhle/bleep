@@ -145,7 +145,7 @@ Authenticated drop is required (mailbox token) so unsigned mail cannot fill a
 box (T24/T25). The authenticated mailbox ID is used for quota and then
 discarded — it is not written next to the destination (T7).
 
-Wake-up (WebSocket and Web Push) payload is `{"v":1,"wake":true}` only (T10). A push subscription stores the browser endpoint. The notice does not include the message or the sender. Android listening is an opt-in foreground loop on the phone. It stops when the process is killed.
+Wake-up (WebSocket and Web Push) payload is `{"v":1,"wake":true}` only (T10). A push subscription stores the browser endpoint. The notice does not include the message or the sender. Android listening is an opt-in foreground loop on the phone. It stops when the process is killed. A phone ring for a call is a blank "Bleep" notice on that device after the sealed offer opens. Quiet hours, a send-later queue, and a star stay on the device. A group poll and each vote are sealed messages. The relay has no schedule, no tally, and no star column.
 
 ## Holdings the relay may produce
 

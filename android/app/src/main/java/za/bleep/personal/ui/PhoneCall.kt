@@ -68,6 +68,8 @@ class PhoneCall(private val app: Context, private val session: Session) {
 
     fun onSignal(who: Peer, payload: JSONObject) {
         val copy = JSONObject(payload.toString())
+        if (copy.optString("phase") == "offer" && phase == "idle") session.ringOffer = true
+        if (copy.optString("phase") == "hangup" || copy.optString("phase") == "missed") session.ringOffer = false
         main.post { handle(who, copy) }
     }
 
@@ -379,6 +381,7 @@ class PhoneCall(private val app: Context, private val session: Session) {
     private fun teardown(sendHangup: Boolean) {
         val who = peer
         val shouldSend = sendHangup && who != null && phase != "idle"
+        session.ringOffer = false
         cancelMissed()
         closed = true
         pendingOffer = null

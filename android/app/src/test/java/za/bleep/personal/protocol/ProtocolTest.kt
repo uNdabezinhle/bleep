@@ -66,6 +66,55 @@ class ProtocolTest {
     }
 
     @Test
+    fun quietHoursWrapPastMidnight() {
+        assertFalse(QuietHours.active(-1, 60, 30))
+        assertFalse(QuietHours.active(60, 60, 60))
+        assertTrue(QuietHours.active(22 * 60, 7 * 60, 23 * 60))
+        assertTrue(QuietHours.active(22 * 60, 7 * 60, 6 * 60))
+        assertFalse(QuietHours.active(22 * 60, 7 * 60, 12 * 60))
+    }
+
+    @Test
+    fun laterSendsADueItemOnce() {
+        val items = listOf(
+            LaterQueue.Item("a", "peer", "later", 500),
+            LaterQueue.Item("b", "peer", "soon", 100),
+        )
+        val split = LaterQueue.takeDue(items, 200)
+        assertEquals("b", split.first.single().id)
+        assertEquals("a", split.second.single().id)
+        assertEquals(null, LaterQueue.enqueue(emptyList(), LaterQueue.Item("c", "", "x", 1)))
+        val full = List(LaterQueue.CAP) { LaterQueue.Item(it.toString(), "t", "x", 9) }
+        assertEquals(null, LaterQueue.enqueue(full, LaterQueue.Item("z", "t", "x", 9)))
+    }
+
+    @Test
+    fun pollReplacesAMemberVoteAndIgnoresANonMember() {
+        val members = setOf("aa", "bb")
+        val once = Polls.applyVote(emptyMap(), "aa", 0, 2, members, false)
+        assertEquals(0, once!!["aa"])
+        val twice = Polls.applyVote(once, "aa", 1, 2, members, false)
+        assertEquals(1, twice!!["aa"])
+        assertEquals(1, Polls.counts(twice, 2)[1])
+        assertEquals(null, Polls.applyVote(twice, "zz", 0, 2, members, false))
+        assertEquals(null, Polls.applyVote(twice, "bb", 0, 2, members, true))
+    }
+
+    @Test
+    fun starDropsWhenTheMessageIsDeleted() {
+        assertTrue(Stars.keep(true, false, false))
+        assertTrue(Stars.keep(false, true, false))
+        assertFalse(Stars.keep(true, true, true))
+    }
+
+    @Test
+    fun ringNoticeHasNoPeerField() {
+        val note = ringNotice()
+        assertEquals("Bleep", note.title)
+        assertEquals(" ", note.text)
+    }
+
+    @Test
     fun handleOrBleepId() {
         assertEquals("k7m2pq9x", Crypto.shortIdFromInput("K7M2-PQ9X"))
         assertEquals("k7m2-pq9x", Crypto.formatShortId("k7m2pq9x"))

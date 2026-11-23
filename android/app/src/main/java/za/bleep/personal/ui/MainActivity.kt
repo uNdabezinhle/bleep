@@ -68,7 +68,12 @@ import za.bleep.personal.protocol.Crypto
 import za.bleep.personal.protocol.Erased
 import za.bleep.personal.protocol.Guardian
 import za.bleep.personal.protocol.Hit
+import za.bleep.personal.protocol.LaterQueue
 import za.bleep.personal.protocol.Peer
+import za.bleep.personal.protocol.Polls
+import za.bleep.personal.protocol.QuietHours
+import za.bleep.personal.protocol.optionsOf
+import za.bleep.personal.protocol.votesOf
 import za.bleep.personal.protocol.REGION
 import za.bleep.personal.protocol.Session
 import org.webrtc.EglBase
@@ -131,6 +136,16 @@ fun BleepRoot(app: BleepApp) {
         }
     }
 
+    val life = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(life, session) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            session.uiResumed = event == androidx.lifecycle.Lifecycle.Event.ON_RESUME
+            if (session.uiResumed) Notify.clearRing(ctx)
+        }
+        life.lifecycle.addObserver(obs)
+        session.uiResumed = life.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        onDispose { life.lifecycle.removeObserver(obs) }
+    }
     val call = remember { PhoneCall(ctx.applicationContext, session) }
     DisposableEffect(session) {
         session.onCall = { who, payload -> call.onSignal(who, payload) }
@@ -414,12 +429,11 @@ fun AppPane(session: Session, tick: Int, bump: () -> Unit, onLock: () -> Unit, o
         while (true) {
             delay(2500)
             try {
-                val n = withContext(Dispatchers.IO) {
+                withContext(Dispatchers.IO) {
                     session.poll()
                     session.pushHistory()
-                    session.lastIngest
                 }
-                if (n > 0) Notify.wake(ctx)
+                Notify.afterPoll(ctx, session)
                 session.regionOk = true
                 bump()
             } catch (_: Erased) {
@@ -588,7 +602,17 @@ fun MePane(session: Session, bump: () -> Unit, onPin: (String) -> Unit, onErased
             ListenService.start(listenCtx)
             bump()
         }) { Text(if (session.listenBackground) "Stop listening" else "Listen in the background", color = Amber) }
-        Text("Checks for mail about every 20 seconds while Bleep stays in the background. The notice does not include the message. A force-stop ends it. This uses more battery.", color = Mute, fontSize = 12.sp)
+        Text("Checks for mail about every 20 seconds while Bleep stays in the background. The notice says Bleep. It does not include the message or the sender. Listening stops if the phone stops the app. A call rings on this phone while Bleep is listening. It does not ring after the app is stopped.", color = Mute, fontSize = 12.sp)
+        var quietFrom by remember { mutableStateOf(QuietHours.clock(session.quietStartMin)) }
+        var quietUntil by remember { mutableStateOf(QuietHours.clock(session.quietEndMin)) }
+        Text("Quiet hours mute the notice and the ring. Messages still arrive. These hours stay on this phone.", color = Mute, fontSize = 12.sp)
+        Field("Quiet from", quietFrom) { quietFrom = it }
+        Field("Quiet until", quietUntil) { quietUntil = it }
+        TextButton(onClick = {
+            session.quietStartMin = QuietHours.parseClock(quietFrom)
+            session.quietEndMin = QuietHours.parseClock(quietUntil)
+            bump()
+        }) { Text("Save quiet hours", color = Amber) }
         TextButton(onClick = {
             session.guardianMode = when (session.guardianMode) {
                 "off" -> "warn"
@@ -766,11 +790,30 @@ fun ChatsPane(session: Session, bump: () -> Unit, open: (Peer) -> Unit, openGrou
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Row(Modifier.fillMaxWidth()) {
-            listOf("chats" to "Chats", "chambers" to "Chambers", "groups" to "Groups", "channels" to "Channels").forEach { (id, label) ->
+            listOf("chats" to "Chats", "chambers" to "Chambers", "groups" to "Groups", "channels" to "Channels", "starred" to "Starred").forEach { (id, label) ->
                 TextButton(onClick = { listMode = id }) {
                     Text(label, color = if (listMode == id) Amber else Mute, fontSize = 13.sp)
                 }
             }
+        }
+        if (listMode == "starred") {
+            val rows = (session.threads.flatMap { (key, list) -> list.map { key to it } } +
+                session.groupThreads.flatMap { (key, list) -> list.map { key to it } })
+                .filter { it.second.starred && !it.second.deleted }
+            if (rows.isEmpty()) Text("No starred messages on this phone.", color = Mute)
+            rows.forEach { (key, m) ->
+                Text(
+                    (m.pollQuestion ?: m.text).ifBlank { m.kind },
+                    color = TextC,
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        when {
+                            key.startsWith("g:") -> openGroup(key.removePrefix("g:"))
+                            else -> session.peers[key]?.let { open(it) }
+                        }
+                    }.padding(vertical = 8.dp),
+                )
+            }
+            return@Column
         }
         if (listMode == "channels") {
             ChannelsBlock(session, bump)
@@ -1062,6 +1105,12 @@ fun ThreadPane(
     var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
     var recFile by remember { mutableStateOf<File?>(null) }
     var viewOnce by remember { mutableStateOf(false) }
+    var laterWhen by remember { mutableStateOf("") }
+    var showLater by remember { mutableStateOf(false) }
+    var showPoll by remember { mutableStateOf(false) }
+    var pollQ by remember { mutableStateOf("") }
+    var pollA by remember { mutableStateOf("") }
+    var pollB by remember { mutableStateOf("") }
     var chamberPin by remember(chamberId) { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
@@ -1315,9 +1364,32 @@ fun ThreadPane(
                             m.text + (if (m.viewOnce) " · Open once" else "") + (m.reacted?.let { "  $it" } ?: ""),
                             color = TextC,
                         )
+                        if (m.kind == "poll" && groupId != null) {
+                            val opts = optionsOf(m.pollOptionsJson)
+                            val counts = Polls.counts(votesOf(m.pollVotesJson), opts.size)
+                            Text("Counts are what this phone has opened.", color = Mute, fontSize = 12.sp)
+                            opts.forEachIndexed { i, opt ->
+                                TextButton(onClick = {
+                                    if (m.pollClosed) return@TextButton
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { session.voteGroupPoll(groupId, m.id, i) }
+                                        bump()
+                                    }
+                                }) { Text("$opt · ${counts.getOrElse(i) { 0 }}", color = Amber, fontSize = 12.sp) }
+                            }
+                            if (m.fromMe && !m.pollClosed) {
+                                TextButton(onClick = {
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { session.closeGroupPoll(groupId, m.id) }
+                                        bump()
+                                    }
+                                }) { Text("Close poll", color = Mute, fontSize = 12.sp) }
+                            }
+                        }
                         if (m.viewOnce && m.viewed && !m.fromMe) Text("Capture is still possible.", color = Mute, fontSize = 12.sp)
                     }
                     Row {
+                        TextButton(onClick = { session.toggleStar(threadKey, m.id); bump() }) { Text(if (m.starred) "★" else "☆", color = Amber, fontSize = 12.sp) }
                         TextButton(onClick = { reply = m }) { Text("Reply", color = Mute, fontSize = 12.sp) }
                         TextButton(onClick = { session.hideForMe(threadKey, m.id); bump() }) { Text("×", color = Mute, fontSize = 12.sp) }
                     }
@@ -1408,6 +1480,43 @@ fun ThreadPane(
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Ink),
             ) { Text("Send") }
+            if (chamberId == null) {
+                TextButton(onClick = { showLater = !showLater }) { Text("Send later", color = Mute, fontSize = 12.sp) }
+            }
+            if (groupId != null) {
+                TextButton(onClick = { showPoll = !showPoll }) { Text("Poll", color = Mute, fontSize = 12.sp) }
+            }
+        }
+        if (showLater && chamberId == null) {
+            Text("Sends while Bleep is open, or while this phone is listening. Otherwise it sends the next time you open Bleep. The relay does not see it early.", color = Mute, fontSize = 12.sp)
+            Field("Minutes, or a clock like 18:30", laterWhen) { laterWhen = it }
+            TextButton(onClick = {
+                val whenAt = LaterQueue.parseSendAt(laterWhen, System.currentTimeMillis())
+                if (text.isBlank() || whenAt < 0) {
+                    note = "Choose a future time."
+                    return@TextButton
+                }
+                note = session.scheduleText(threadKey, text, whenAt)
+                text = ""
+                showLater = false
+                bump()
+            }) { Text("Schedule", color = Amber) }
+        }
+        if (showPoll && groupId != null) {
+            Field("Question", pollQ) { pollQ = it }
+            Field("Choice 1", pollA) { pollA = it }
+            Field("Choice 2", pollB) { pollB = it }
+            TextButton(onClick = {
+                scope.launch {
+                    try {
+                        withContext(Dispatchers.IO) { session.sendGroupPoll(groupId, pollQ, listOf(pollA, pollB)) }
+                        pollQ = ""; pollA = ""; pollB = ""; showPoll = false
+                    } catch (e: Exception) {
+                        note = e.message ?: "A poll needs a question and at least two choices."
+                    }
+                    bump()
+                }
+            }) { Text("Send poll", color = Amber) }
         }
     }
 }

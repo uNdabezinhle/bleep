@@ -16,6 +16,11 @@ data class SharedMsg(
     val expiresAt: Long? = null,
     val reacted: String? = null,
     val fromMailbox: String? = null,
+    val starred: Boolean = false,
+    val pollQuestion: String? = null,
+    val pollOptions: List<String> = emptyList(),
+    val pollClosed: Boolean = false,
+    val pollVotes: Map<String, Int> = emptyMap(),
 )
 
 fun mergeSharedMessages(local: List<SharedMsg>, remote: List<SharedMsg>): List<SharedMsg> {
@@ -24,14 +29,22 @@ fun mergeSharedMessages(local: List<SharedMsg>, remote: List<SharedMsg>): List<S
     remote.forEach { incoming ->
         val prev = by[incoming.id]
         if (prev == null) by[incoming.id] = incoming
-        else by[incoming.id] = incoming.copy(
-            attachmentId = incoming.attachmentId ?: prev.attachmentId,
-            expiresAt = incoming.expiresAt ?: prev.expiresAt,
-            reacted = incoming.reacted ?: prev.reacted,
-            fromMailbox = incoming.fromMailbox ?: prev.fromMailbox,
-            text = if (incoming.deleted) "" else incoming.text.ifBlank { prev.text },
-            deleted = incoming.deleted || prev.deleted,
-        )
+        else {
+            val deleted = incoming.deleted || prev.deleted
+            by[incoming.id] = incoming.copy(
+                attachmentId = incoming.attachmentId ?: prev.attachmentId,
+                expiresAt = incoming.expiresAt ?: prev.expiresAt,
+                reacted = incoming.reacted ?: prev.reacted,
+                fromMailbox = incoming.fromMailbox ?: prev.fromMailbox,
+                text = if (incoming.deleted) "" else incoming.text.ifBlank { prev.text },
+                deleted = deleted,
+                starred = Stars.keep(prev.starred, incoming.starred, deleted),
+                pollQuestion = incoming.pollQuestion ?: prev.pollQuestion,
+                pollOptions = if (incoming.pollOptions.isNotEmpty()) incoming.pollOptions else prev.pollOptions,
+                pollClosed = incoming.pollClosed || prev.pollClosed,
+                pollVotes = prev.pollVotes + incoming.pollVotes,
+            )
+        }
     }
     return by.values.sortedWith(compareBy({ it.at }, { it.id }))
 }

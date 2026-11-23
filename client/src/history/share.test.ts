@@ -116,4 +116,21 @@ describe("shared history threads", () => {
     expect(s.messages["g:group1"]?.[0]?.text).toBe("hi");
     expect(s.messages["g:group1"]?.[0]?.fromMailbox).toBe(peer);
   });
+
+  it("keeps a star from either side and drops it when the message is deleted", () => {
+    const s = snap();
+    const canonical = dmThreadId(self, peer);
+    s.messages[canonical] = [
+      { id: "m1", threadId: canonical, fromMe: true, kind: "text", text: "hi", at: 1, starred: true },
+      { id: "m2", threadId: canonical, fromMe: false, kind: "text", text: "yo", at: 2 },
+    ];
+    foldSharedHistory(s, undefined, {
+      [canonical]: [
+        { id: "m1", threadId: canonical, fromMe: true, kind: "text", text: "hi", at: 1 },
+        { id: "m2", threadId: canonical, fromMe: false, kind: "text", text: "", at: 2, deleted: true, starred: true },
+      ],
+    });
+    expect(s.messages[canonical]?.find((m) => m.id === "m1")?.starred).toBe(true);
+    expect(s.messages[canonical]?.find((m) => m.id === "m2")?.starred).toBe(false);
+  });
 });

@@ -44,7 +44,7 @@ export type Thread = {
   lockedStub?: boolean;
 };
 
-export type MsgKind = "text" | "photo" | "voice" | "file" | "system" | "call" | "location";
+export type MsgKind = "text" | "photo" | "voice" | "file" | "system" | "call" | "location" | "poll";
 
 export type Message = {
   id: string;
@@ -75,6 +75,8 @@ export type Message = {
   lat?: number;
   lon?: number;
   until?: number;
+  starred?: boolean;
+  poll?: { question: string; options: string[]; closed?: boolean; votes?: Record<string, number> };
 };
 
 export type SessionRec = {
@@ -139,6 +141,11 @@ export type VaultSnapshot = {
   prekeys: { spk: PrekeyHold; opks: PrekeyHold[] };
   androidPocket?: unknown;
   androidPocketKnown?: boolean;
+  /** Unsent text on this device. Not part of the shared history blob. */
+  later?: { id: string; threadId: string; text: string; sendAt: number }[];
+  /** Minutes from midnight. Not sent to the relay. */
+  quietStartMin?: number | null;
+  quietEndMin?: number | null;
 };
 
 export type StatusItem = {

@@ -48,7 +48,7 @@ class ListenService : Service() {
                 try {
                     session.poll()
                     session.pushHistory()
-                    if (session.lastIngest > 0) Notify.wake(svc)
+                    Notify.afterPoll(svc, session)
                     if (app.livePin.length >= 4) app.vault.save(app.livePin, session.snapshot())
                 } catch (_: Exception) {
                 }

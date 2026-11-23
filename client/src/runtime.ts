@@ -39,6 +39,7 @@ import { applyLeave } from "./history/groups";
 import { foldSharedHistory, keptKey, peerKeyReady, type LooseMsg } from "./history/share";
 import { OTHER_DEVICE, conflictStep, isRatchetDump, mergeSharedDumps, x3dhChoice } from "./history/sessionLock";
 import type { SerializedRatchet } from "./protocol/ratchet";
+import { applyVote, closePoll, enqueueLater, takeDue, type PollState } from "./special/features";
 
 
 export type UiNotice = { kind: "error" | "info" | "region"; text: string };
@@ -841,6 +842,7 @@ export class Runtime {
   private async pollBody(): Promise<void> {
     if (!this.token || !this.snap || this.locked) return;
     try {
+      await this.flushLater();
       const items = (await api.fetch(this.token)) as { id: string; blob_b64: string }[];
       const ack: string[] = [];
       for (const it of items) {
@@ -917,6 +919,11 @@ export class Runtime {
     this.retitle(peer);
     if (inc.payload.id && this.alreadyHave(inc.payload.id)) return true;
     if (peer.blocked) return true;
+
+    if (inc.payload.kind === "poll" || inc.payload.kind === "vote" || inc.payload.kind === "poll-close") {
+      this.ingestPoll(mailboxId, inc.payload);
+      return true;
+    }
 
     if (inc.payload.kind === "intro" && (!peer.accepted || inc.payload.chamber || inc.payload.groupId)) {
       const msg: Message = {
@@ -1076,6 +1083,7 @@ export class Runtime {
       if (m) {
         m.deleted = true;
         m.text = "";
+        m.starred = false;
       }
       return true;
     }
@@ -1485,7 +1493,136 @@ export class Runtime {
   deleteForMe(msg: Message): void {
     msg.deleted = true;
     msg.text = "";
+    msg.starred = false;
     this.bump();
+  }
+
+  toggleStar(msg: Message): void {
+    if (!this.snap || msg.deleted) return;
+    msg.starred = !msg.starred;
+    this.bump();
+  }
+
+  scheduleText(thread: Thread, text: string, sendAt: number): string {
+    if (!this.snap) return "Open Bleep first.";
+    if (thread.kind !== "dm" && thread.kind !== "group") return "Send later stays on a direct chat or a group.";
+    const next = enqueueLater(this.snap.later ?? [], {
+      id: crypto.randomUUID(),
+      threadId: thread.id,
+      text,
+      sendAt,
+    });
+    if (!next) return "Twenty scheduled messages is the limit on this device.";
+    this.snap.later = next;
+    this.bump();
+    return "Scheduled on this device. It sends while Bleep is open. If Bleep is closed, it sends the next time you open it.";
+  }
+
+  async sendPoll(thread: Thread, question: string, options: string[]): Promise<void> {
+    if (!this.snap || !this.token || thread.kind !== "group" || !thread.groupId) return;
+    const clean = options.map((s) => s.trim()).filter(Boolean).slice(0, 4);
+    if (!question.trim() || clean.length < 2) throw new Error("A poll needs a question and at least two choices.");
+    const peers = this.destPeers(thread);
+    if (!peers.length) throw new Error("no peer");
+    const id = crypto.randomUUID();
+    const poll: PollState = { question: question.trim().slice(0, 120), options: clean.map((s) => s.slice(0, 40)), votes: {} };
+    const msg: Message = {
+      id,
+      threadId: thread.id,
+      fromMe: true,
+      fromMailbox: this.snap.identity.mailboxId,
+      kind: "poll",
+      text: poll.question,
+      at: Date.now(),
+      status: "queued",
+      poll,
+      groupId: thread.groupId,
+    };
+    appendMsg(this.snap, msg);
+    for (const peer of peers) {
+      await this.tryDrop(peer, { kind: "poll", id, question: poll.question, options: poll.options, groupId: thread.groupId }, msg);
+    }
+    this.bump();
+  }
+
+  async votePoll(thread: Thread, pollId: string, option: number): Promise<void> {
+    if (!this.snap || !this.token || !thread.groupId) return;
+    const msg = (this.snap.messages[thread.id] ?? []).find((m) => m.id === pollId);
+    if (!msg?.poll) return;
+    const members = this.snap.groups[thread.groupId]?.members.map((m) => m.mailboxId) ?? [];
+    const next = applyVote(msg.poll, this.snap.identity.mailboxId, option, members);
+    if (!next) return;
+    msg.poll = next;
+    const id = crypto.randomUUID();
+    for (const peer of this.destPeers(thread)) {
+      await this.seal(peer, { kind: "vote", id, pollId, option, groupId: thread.groupId });
+    }
+    this.bump();
+  }
+
+  async closePollMessage(thread: Thread, pollId: string): Promise<void> {
+    if (!this.snap || !this.token || !thread.groupId) return;
+    const msg = (this.snap.messages[thread.id] ?? []).find((m) => m.id === pollId);
+    if (!msg?.poll) return;
+    const author = msg.fromMailbox || this.snap.identity.mailboxId;
+    const next = closePoll(msg.poll, this.snap.identity.mailboxId, author);
+    if (!next) return;
+    msg.poll = next;
+    const id = crypto.randomUUID();
+    for (const peer of this.destPeers(thread)) {
+      await this.seal(peer, { kind: "poll-close", id, pollId, groupId: thread.groupId });
+    }
+    this.bump();
+  }
+
+  private async flushLater(): Promise<void> {
+    if (!this.snap || !this.token || this.locked) return;
+    const split = takeDue(this.snap.later ?? [], Date.now());
+    this.snap.later = split.waiting;
+    for (const item of split.due) {
+      const thread = this.snap.threads[item.threadId];
+      if (!thread || thread.kind === "chamber" || thread.kind === "status") continue;
+      try {
+        await this.commitSend(thread, item.text, []);
+      } catch {
+        this.snap.later = [...(this.snap.later ?? []), item];
+      }
+    }
+  }
+
+  private ingestPoll(mailboxId: string, payload: Extract<Payload, { kind: "poll" | "vote" | "poll-close" }>): void {
+    if (!this.snap) return;
+    const groupId = payload.groupId;
+    const group = this.snap.groups[groupId];
+    if (!group) return;
+    const members = group.members.map((m) => m.mailboxId);
+    if (!members.includes(mailboxId)) return;
+    const threadId = "g:" + groupId;
+    if (payload.kind === "poll") {
+      const poll: PollState = { question: payload.question, options: payload.options, votes: {} };
+      appendMsg(this.snap, {
+        id: payload.id,
+        threadId,
+        fromMe: false,
+        fromMailbox: mailboxId,
+        kind: "poll",
+        text: payload.question,
+        at: Date.now(),
+        poll,
+        groupId,
+      });
+      return;
+    }
+    const msg = (this.snap.messages[threadId] ?? []).find((m) => m.id === payload.pollId);
+    if (!msg?.poll) return;
+    if (payload.kind === "vote") {
+      const next = applyVote(msg.poll, mailboxId, payload.option, members);
+      if (next) msg.poll = next;
+      return;
+    }
+    const author = msg.fromMailbox || (msg.fromMe ? this.snap.identity.mailboxId : "");
+    const next = closePoll(msg.poll, mailboxId, author);
+    if (next) msg.poll = next;
   }
 
   async deleteForEveryone(thread: Thread, msg: Message): Promise<void> {

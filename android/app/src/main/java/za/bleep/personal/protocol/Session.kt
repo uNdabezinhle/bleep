@@ -73,6 +73,11 @@ data class ChatMsg(
     val groupName: String? = null,
     val chamberInvite: Boolean = false,
     val burnAt: Long? = null,
+    val starred: Boolean = false,
+    val pollQuestion: String? = null,
+    val pollOptionsJson: String? = null,
+    val pollClosed: Boolean = false,
+    val pollVotesJson: String? = null,
 )
 
 class Session(private val relay: Relay) {
@@ -143,6 +148,11 @@ class Session(private val relay: Relay) {
     var guardianMode: String = "warn"
     var autoLockSec: Int = 60
     var listenBackground: Boolean = false
+    var quietStartMin: Int = -1
+    var quietEndMin: Int = -1
+    val later = mutableListOf<LaterQueue.Item>()
+    var ringOffer: Boolean = false
+    var uiResumed: Boolean = false
     private val ioLock = Any()
     var shortId: String? = null
     var handle: String? = null
@@ -293,6 +303,13 @@ class Session(private val relay: Relay) {
         .put("guardianMode", guardianMode)
         .put("autoLockSec", autoLockSec)
         .put("listenBackground", listenBackground)
+        .put("quietStartMin", quietStartMin)
+        .put("quietEndMin", quietEndMin)
+        .put("later", org.json.JSONArray().also { arr ->
+            later.forEach {
+                arr.put(JSONObject().put("id", it.id).put("threadKey", it.threadKey).put("text", it.text).put("sendAt", it.sendAt))
+            }
+        })
         .put("shortId", shortId ?: JSONObject.NULL)
         .put("handle", handle ?: JSONObject.NULL)
         .put("avatarId", avatarId ?: JSONObject.NULL)
@@ -333,6 +350,8 @@ class Session(private val relay: Relay) {
         guardianMode = snap.optString("guardianMode", "warn").ifBlank { "warn" }
         autoLockSec = snap.optInt("autoLockSec", 60)
         listenBackground = snap.optBoolean("listenBackground", false)
+        quietStartMin = snap.optInt("quietStartMin", -1)
+        quietEndMin = snap.optInt("quietEndMin", -1)
         shortId = snap.optString("shortId").ifBlank { null }
         handle = snap.optString("handle").ifBlank { null }
         avatarId = if (snap.isNull("avatarId")) null else snap.optString("avatarId").ifBlank { "" }
@@ -361,7 +380,7 @@ class Session(private val relay: Relay) {
     }
 
     private fun loadLists(snap: JSONObject) {
-        peers.clear(); threads.clear(); groupThreads.clear(); groups.clear(); chambers.clear(); chamberThreads.clear(); statuses.clear()
+        peers.clear(); threads.clear(); groupThreads.clear(); groups.clear(); chambers.clear(); chamberThreads.clear(); statuses.clear(); later.clear()
         chamberPins.clear()
         ratchets.clear(); requests.clear(); outbox.clear(); blocked.clear()
         opks.clear()
@@ -421,6 +440,109 @@ class Session(private val relay: Relay) {
             chamberThreads[k] = MutableList(arr.length()) { i -> msgFrom(arr.getJSONObject(i)) }
         }
         chambers.values.forEach { it.unlocked = false }
+        snap.optJSONArray("later")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                later += LaterQueue.Item(o.optString("id"), o.optString("threadKey"), o.optString("text"), o.optLong("sendAt"))
+            }
+        }
+    }
+
+    fun quietNow(nowMs: Long = System.currentTimeMillis()): Boolean {
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = nowMs
+        val nowMin = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
+        return QuietHours.active(quietStartMin, quietEndMin, nowMin)
+    }
+
+    fun scheduleText(threadKey: String, text: String, sendAt: Long): String {
+        if (threadKey.startsWith("ch:")) return "Send later stays on a direct chat or a group."
+        val next = LaterQueue.enqueue(later.toList(), LaterQueue.Item(java.util.UUID.randomUUID().toString(), threadKey, text, sendAt))
+            ?: return "Twenty scheduled messages is the limit on this device."
+        later.clear()
+        later.addAll(next)
+        return "Scheduled on this phone. It sends while Bleep is open, or while this phone is listening. Otherwise it sends the next time you open Bleep."
+    }
+
+    private fun flushLater() {
+        if (!ready) return
+        val split = LaterQueue.takeDue(later.toList(), System.currentTimeMillis())
+        later.clear()
+        later.addAll(split.second)
+        for (item in split.first) {
+            if (item.threadKey.startsWith("ch:")) continue
+            try {
+                if (item.threadKey.startsWith("g:")) sendGroupText(item.threadKey.removePrefix("g:"), item.text)
+                else {
+                    val peer = peers[item.threadKey] ?: continue
+                    sendText(peer, item.text)
+                }
+            } catch (_: Exception) {
+                later += item
+            }
+        }
+    }
+
+    private fun ingestPoll(mid: String, pt: JSONObject): Boolean {
+        val gid = pt.optString("groupId")
+        val group = groups[gid] ?: return false
+        val members = group.members.map { it.mailboxId }.toSet()
+        if (mid !in members) return false
+        val key = "g:$gid"
+        return when (pt.optString("kind")) {
+            "poll" -> {
+                val id = pt.optString("id")
+                if (id.isBlank() || alreadyHave(id)) return false
+                val options = pt.optJSONArray("options")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: return false
+                if (options.size < 2) return false
+                groupThreads.getOrPut(key) { mutableListOf() } += ChatMsg(
+                    id,
+                    false,
+                    pt.optString("question"),
+                    System.currentTimeMillis(),
+                    mid,
+                    kind = "poll",
+                    pollQuestion = pt.optString("question").take(120),
+                    pollOptionsJson = optionsJson(options.map { it.take(40) }),
+                    groupId = gid,
+                )
+                true
+            }
+            "vote" -> {
+                val list = groupThreads[key] ?: return false
+                val i = list.indexOfFirst { it.id == pt.optString("pollId") }
+                if (i < 0) return false
+                val row = list[i]
+                val next = Polls.applyVote(
+                    votesOf(row.pollVotesJson),
+                    mid,
+                    pt.optInt("option", -1),
+                    optionsOf(row.pollOptionsJson).size,
+                    members,
+                    row.pollClosed,
+                ) ?: return false
+                list[i] = row.copy(pollVotesJson = votesJson(next))
+                true
+            }
+            "poll-close" -> {
+                val list = groupThreads[key] ?: return false
+                val i = list.indexOfFirst { it.id == pt.optString("pollId") }
+                if (i < 0) return false
+                val row = list[i]
+                val author = row.peerId.ifBlank { if (row.fromMe) id.mailboxId else "" }
+                if (mid != author) return false
+                list[i] = row.copy(pollClosed = true)
+                true
+            }
+            else -> false
+        }
+    }
+
+    fun toggleStar(threadKey: String, msgId: String) {
+        val list = bucket(threadKey) ?: return
+        val i = list.indexOfFirst { it.id == msgId }
+        if (i < 0 || list[i].deleted) return
+        list[i] = list[i].copy(starred = !list[i].starred)
     }
 
     private fun msgJson(m: ChatMsg) = JSONObject()
@@ -446,6 +568,11 @@ class Session(private val relay: Relay) {
         .put("groupName", m.groupName ?: JSONObject.NULL)
         .put("chamberInvite", m.chamberInvite)
         .put("burnAt", m.burnAt ?: JSONObject.NULL)
+        .put("starred", m.starred && !m.deleted)
+        .put("pollQuestion", m.pollQuestion ?: JSONObject.NULL)
+        .put("pollOptionsJson", m.pollOptionsJson ?: JSONObject.NULL)
+        .put("pollClosed", m.pollClosed)
+        .put("pollVotesJson", m.pollVotesJson ?: JSONObject.NULL)
 
     private fun msgFrom(o: JSONObject) = ChatMsg(
         o.getString("id"),
@@ -470,6 +597,11 @@ class Session(private val relay: Relay) {
         o.optString("groupName").ifBlank { null },
         o.optBoolean("chamberInvite") || o.optBoolean("chamber"),
         if (o.isNull("burnAt")) null else o.optLong("burnAt").takeIf { it > 0 },
+        o.optBoolean("starred") && !o.optBoolean("deleted"),
+        o.optString("pollQuestion").ifBlank { null },
+        o.optString("pollOptionsJson").ifBlank { null },
+        o.optBoolean("pollClosed"),
+        o.optString("pollVotesJson").ifBlank { null },
     )
 
     fun addByCode(code: String): Peer {
@@ -695,6 +827,7 @@ class Session(private val relay: Relay) {
         callBatch = calls
         try {
         lastIngest = 0
+        flushLater()
         liftShortIds()
         flushOutbox()
         val items = relay.fetch(token)
@@ -949,6 +1082,11 @@ class Session(private val relay: Relay) {
                 callBatch?.add(who to JSONObject(pt.toString()))
             }
             if (pt.optString("phase") == "offer") lastIngest++
+            if (pt.optString("phase") == "hangup" || pt.optString("phase") == "missed") ringOffer = false
+            return true
+        }
+        if (kind == "poll" || kind == "vote" || kind == "poll-close") {
+            if (ingestPoll(mid, pt)) lastIngest++
             return true
         }
         if (kind == "react") {
@@ -1304,6 +1442,11 @@ class Session(private val relay: Relay) {
         .put("replyText", m.replyText ?: JSONObject.NULL)
         .put("expiresAt", m.expiresAt ?: JSONObject.NULL)
         .put("reacted", m.reacted ?: JSONObject.NULL)
+        .put("starred", m.starred && !m.deleted)
+        .put("pollQuestion", m.pollQuestion ?: JSONObject.NULL)
+        .put("pollOptions", if (m.pollOptionsJson.isNullOrBlank()) JSONObject.NULL else org.json.JSONArray(optionsOf(m.pollOptionsJson)))
+        .put("pollClosed", m.pollClosed)
+        .put("pollVotes", if (m.pollVotesJson.isNullOrBlank()) JSONObject.NULL else JSONObject(m.pollVotesJson))
 
     private fun webOverlay(): JSONObject {
         val web = if (webPocket == null) JSONObject() else JSONObject(webPocket.toString())
@@ -1531,6 +1674,7 @@ class Session(private val relay: Relay) {
                 SharedMsg(
                     it.id, it.text, it.at, it.fromMe, it.fileId, it.kind, it.viewOnce, it.replyTo, it.replyText,
                     it.mime, it.name, it.deleted, it.expiresAt, it.reacted, it.peerId.ifBlank { null },
+                    it.starred, it.pollQuestion, optionsOf(it.pollOptionsJson), it.pollClosed, votesOf(it.pollVotesJson),
                 )
             },
             List(incoming.length()) { i ->
@@ -1552,6 +1696,15 @@ class Session(private val relay: Relay) {
                     if (o.has("expiresAt") && !o.isNull("expiresAt")) o.optLong("expiresAt") else null,
                     o.optString("reacted").ifBlank { null },
                     o.optString("fromMailbox").ifBlank { o.optString("peerId").ifBlank { null } },
+                    o.optBoolean("starred") && !o.optBoolean("deleted"),
+                    o.optString("pollQuestion").ifBlank { null },
+                    o.optJSONArray("pollOptions")?.let { arr -> List(arr.length()) { arr.getString(it) } } ?: emptyList(),
+                    o.optBoolean("pollClosed"),
+                    o.optJSONObject("pollVotes")?.let { votes ->
+                        val out = linkedMapOf<String, Int>()
+                        votes.keys().forEach { out[it] = votes.getInt(it) }
+                        out
+                    } ?: emptyMap(),
                 )
             },
         )
@@ -1572,6 +1725,11 @@ class Session(private val relay: Relay) {
                     expiresAt = sm.expiresAt ?: prev.expiresAt,
                     reacted = sm.reacted ?: prev.reacted,
                     peerId = if (key.startsWith("g:")) sm.fromMailbox ?: prev.peerId else prev.peerId.ifBlank { peerId },
+                    starred = Stars.keep(prev.starred, sm.starred, sm.deleted || prev.deleted),
+                    pollQuestion = sm.pollQuestion ?: prev.pollQuestion,
+                    pollOptionsJson = optionsJson(if (sm.pollOptions.isNotEmpty()) sm.pollOptions else optionsOf(prev.pollOptionsJson)),
+                    pollClosed = sm.pollClosed || prev.pollClosed,
+                    pollVotesJson = votesJson(votesOf(prev.pollVotesJson) + sm.pollVotes),
                 )
             } else {
                 ChatMsg(
@@ -1591,6 +1749,11 @@ class Session(private val relay: Relay) {
                     viewOnce = sm.viewOnce,
                     deleted = sm.deleted,
                     groupId = if (key.startsWith("g:")) key.removePrefix("g:") else null,
+                    starred = sm.starred && !sm.deleted,
+                    pollQuestion = sm.pollQuestion,
+                    pollOptionsJson = optionsJson(sm.pollOptions),
+                    pollClosed = sm.pollClosed,
+                    pollVotesJson = votesJson(sm.pollVotes),
                 )
             }
         }.toMutableList()
@@ -1717,7 +1880,7 @@ class Session(private val relay: Relay) {
         val list = bucket(threadKey) ?: return
         val i = list.indexOfFirst { it.id == msgId }
         if (i < 0) return
-        list[i] = list[i].copy(deleted = true, text = "", bytesB64 = null)
+        list[i] = list[i].copy(deleted = true, text = "", bytesB64 = null, starred = false)
     }
 
     fun setProfilePhoto(bytes: ByteArray) {
@@ -2176,6 +2339,66 @@ class Session(private val relay: Relay) {
             replyText = replyText,
             viewOnce = viewOnce,
         )
+    }
+
+    fun sendGroupPoll(groupId: String, question: String, options: List<String>) {
+        val clean = options.map { it.trim() }.filter { it.isNotEmpty() }.take(4).map { it.take(40) }
+        val asked = question.trim().take(120)
+        if (asked.isEmpty() || clean.size < 2) error("A poll needs a question and at least two choices.")
+        val dest = groupDestinations(groupId)
+        if (dest.isEmpty()) error("no peer")
+        val msgId = java.util.UUID.randomUUID().toString()
+        val payload = JSONObject()
+            .put("kind", "poll")
+            .put("id", msgId)
+            .put("question", asked)
+            .put("options", org.json.JSONArray(clean))
+            .put("groupId", groupId)
+        dest.forEach { sendPayload(it, payload, intro = false) }
+        groupThreads.getOrPut("g:$groupId") { mutableListOf() } += ChatMsg(
+            msgId,
+            true,
+            asked,
+            System.currentTimeMillis(),
+            id.mailboxId,
+            kind = "poll",
+            pollQuestion = asked,
+            pollOptionsJson = optionsJson(clean),
+            groupId = groupId,
+        )
+    }
+
+    fun voteGroupPoll(groupId: String, pollId: String, option: Int) {
+        val list = groupThreads["g:$groupId"] ?: return
+        val i = list.indexOfFirst { it.id == pollId }
+        if (i < 0) return
+        val row = list[i]
+        val members = groups[groupId]?.members?.map { it.mailboxId }?.toSet() ?: return
+        val next = Polls.applyVote(votesOf(row.pollVotesJson), id.mailboxId, option, optionsOf(row.pollOptionsJson).size, members, row.pollClosed) ?: return
+        list[i] = row.copy(pollVotesJson = votesJson(next))
+        val payload = JSONObject()
+            .put("kind", "vote")
+            .put("id", java.util.UUID.randomUUID().toString())
+            .put("pollId", pollId)
+            .put("option", option)
+            .put("groupId", groupId)
+        groupDestinations(groupId).forEach { sendPayload(it, payload, intro = false) }
+    }
+
+    fun closeGroupPoll(groupId: String, pollId: String) {
+        val list = groupThreads["g:$groupId"] ?: return
+        val i = list.indexOfFirst { it.id == pollId }
+        if (i < 0) return
+        val row = list[i]
+        val author = row.peerId.ifBlank { if (row.fromMe) id.mailboxId else "" }
+        if (id.mailboxId != author) return
+        list[i] = row.copy(pollClosed = true)
+        val payload = JSONObject()
+            .put("kind", "poll-close")
+            .put("id", java.util.UUID.randomUUID().toString())
+            .put("pollId", pollId)
+            .put("groupId", groupId)
+        groupDestinations(groupId).forEach { sendPayload(it, payload, intro = false) }
     }
 
     fun sendGroupMedia(
