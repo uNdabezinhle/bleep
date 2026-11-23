@@ -9,6 +9,21 @@ data class RingNotice(val title: String, val text: String)
 
 fun ringNotice(): RingNotice = RingNotice("Bleep", " ")
 
+object Alerts {
+    private val mailKinds = setOf("text", "photo", "voice", "file", "intro", "poll", "poll-close")
+    private val mailOps = setOf("screen-capture", "status", "profile", "leave-group")
+
+    /** True when this device should play the mail alert. A call offer is not mail. `phase` is accepted so a call check can name offer or ice. */
+    @Suppress("UNUSED_PARAMETER")
+    fun mail(kind: String, phase: String = "", op: String = "", quiet: Boolean = false, enabled: Boolean = true): Boolean {
+        if (quiet || !enabled) return false
+        if (kind == "call") return false
+        if (kind == "typing" || kind == "receipt" || kind == "react" || kind == "vote") return false
+        if (kind == "ctrl") return op in mailOps
+        return kind in mailKinds
+    }
+}
+
 object QuietHours {
     fun active(startMin: Int, endMin: Int, nowMin: Int): Boolean {
         if (startMin < 0 || endMin < 0 || startMin > 1439 || endMin > 1439) return false

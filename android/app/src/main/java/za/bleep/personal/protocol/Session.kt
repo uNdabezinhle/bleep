@@ -150,6 +150,9 @@ class Session(private val relay: Relay) {
     var listenBackground: Boolean = false
     var quietStartMin: Int = -1
     var quietEndMin: Int = -1
+    /** Mail alert on this device. The call ring does not use this flag. */
+    var alertSound: Boolean = true
+    var mailAlert: Int = 0
     val later = mutableListOf<LaterQueue.Item>()
     var ringOffer: Boolean = false
     var uiResumed: Boolean = false
@@ -305,6 +308,7 @@ class Session(private val relay: Relay) {
         .put("listenBackground", listenBackground)
         .put("quietStartMin", quietStartMin)
         .put("quietEndMin", quietEndMin)
+        .put("alertSound", alertSound)
         .put("later", org.json.JSONArray().also { arr ->
             later.forEach {
                 arr.put(JSONObject().put("id", it.id).put("threadKey", it.threadKey).put("text", it.text).put("sendAt", it.sendAt))
@@ -352,6 +356,7 @@ class Session(private val relay: Relay) {
         listenBackground = snap.optBoolean("listenBackground", false)
         quietStartMin = snap.optInt("quietStartMin", -1)
         quietEndMin = snap.optInt("quietEndMin", -1)
+        alertSound = snap.optBoolean("alertSound", true)
         shortId = snap.optString("shortId").ifBlank { null }
         handle = snap.optString("handle").ifBlank { null }
         avatarId = if (snap.isNull("avatarId")) null else snap.optString("avatarId").ifBlank { "" }
@@ -827,6 +832,7 @@ class Session(private val relay: Relay) {
         callBatch = calls
         try {
         lastIngest = 0
+        mailAlert = 0
         flushLater()
         liftShortIds()
         flushOutbox()
@@ -1015,7 +1021,7 @@ class Session(private val relay: Relay) {
                 mid,
                 kind = "system",
             )
-            lastIngest++
+            noteMail("ctrl", "screen-capture")
             return true
         }
         if (kind == "ctrl" && pt.optString("op") == "status") {
@@ -1037,7 +1043,7 @@ class Session(private val relay: Relay) {
                 raw,
             )
             if (statuses.none { it.id == item.id }) statuses.add(0, item)
-            lastIngest++
+            noteMail("ctrl", "status")
             return true
         }
         if (kind == "ctrl" && pt.optString("op") == "profile") {
@@ -1053,7 +1059,7 @@ class Session(private val relay: Relay) {
                 peer.avatarId = java.util.UUID.randomUUID().toString()
                 peer.avatarB64 = raw
             }
-            lastIngest++
+            noteMail("ctrl", "profile")
             return true
         }
         if (kind == "ctrl" && pt.optString("op") == "leave-group") {
@@ -1071,6 +1077,7 @@ class Session(private val relay: Relay) {
                         mid,
                         kind = "system",
                     )
+                    if (Alerts.mail("ctrl", op = "leave-group")) mailAlert++
                 }
             }
             lastIngest++
@@ -1086,7 +1093,7 @@ class Session(private val relay: Relay) {
             return true
         }
         if (kind == "poll" || kind == "vote" || kind == "poll-close") {
-            if (ingestPoll(mid, pt)) lastIngest++
+            if (ingestPoll(mid, pt)) noteMail(kind)
             return true
         }
         if (kind == "react") {
@@ -1135,7 +1142,7 @@ class Session(private val relay: Relay) {
         val holdIntro = kind == "intro" && (!peer.accepted || groupInvite != null || msg.chamberInvite)
         if (holdIntro || !peer.accepted) {
             requests += msg
-            lastIngest++
+            noteMail(kind)
             if (kind == "intro") {
                 val incoming = pt.optString("handle").removePrefix("@").lowercase()
                 if (incoming.isNotEmpty()) peer.displayName = "@$incoming"
@@ -1152,19 +1159,19 @@ class Session(private val relay: Relay) {
         }
         if (!groupInvite.isNullOrBlank() && groups.containsKey(groupInvite)) {
             groupThreads.getOrPut("g:$groupInvite") { mutableListOf() } += msg
-            lastIngest++
+            noteMail(if (kind == "location") kind else msgKind)
             return true
         }
         if (!groupInvite.isNullOrBlank()) {
             requests += msg
-            lastIngest++
+            noteMail(if (kind == "location") kind else msgKind)
             return true
         }
         if (pt.optBoolean("chamber") && kind != "intro") {
             val chamber = chambers.values.find { it.peerMailboxId == mid || it.id == mid }
             if (chamber != null) chamberThreads.getOrPut("ch:${chamber.id}") { mutableListOf() } += msg
             else requests += msg.copy(chamberInvite = true)
-            lastIngest++
+            noteMail(if (kind == "location") kind else msgKind)
             return true
         }
         threads.getOrPut(mid) { mutableListOf() } += msg
@@ -1185,8 +1192,13 @@ class Session(private val relay: Relay) {
                 )
             }
         }
-        lastIngest++
+        noteMail(if (kind == "location") kind else msgKind)
         return true
+    }
+
+    private fun noteMail(kind: String, op: String = "") {
+        lastIngest++
+        if (Alerts.mail(kind, op = op)) mailAlert++
     }
 
     fun verifyPeer(peer: Peer) {

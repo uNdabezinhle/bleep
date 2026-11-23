@@ -5,6 +5,7 @@ import { api } from "../net/api";
 import { rt } from "./instance";
 import { disappearAction, disappearPhrase, muteAction, replySnippet } from "../chat/prefs";
 import { clockOfMinutes, minutesOfClock, tally } from "../special/features";
+import { unlockAlert } from "../special/alertSound";
 import { bleepCode, formatRecovery, formatShortId, freshRecoverySeed } from "../protocol/keys";
 import { pairSafety } from "../session/session";
 import { navigate } from "../site/router";
@@ -138,7 +139,10 @@ export function App({ path = "/app" }: { path?: string }) {
     });
     const on = () => setNarrow(window.innerWidth < 840);
     window.addEventListener("resize", on);
-    const act = () => rt.touch();
+    const act = () => {
+      rt.touch();
+      unlockAlert();
+    };
     window.addEventListener("pointerdown", act);
     window.addEventListener("keydown", act);
     return () => {
@@ -1565,7 +1569,22 @@ function SettingsPane({ slide, onSlide, onErased }: { slide: number; onSlide: (i
           <div>
             <h3>Background notice</h3>
             <p className="note">The notice says Bleep. It does not include the message or the sender. The browser push service can see that a notice was sent. This box sends notices only after a push key is set. A call rings on the phone while Bleep is listening. It does not ring after the app is stopped.</p>
-            <p className="note">Quiet hours mute the phone notice and the ring. Messages still arrive. These hours stay on this device. The website notice still arrives if this browser allowed it, because the box does not learn the hours.</p>
+            <p className="note">Alert sound plays on this page. It does not say who sent the message.</p>
+            {rt.alertBlocked && <p className="note">This browser plays the alert after you tap the page.</p>}
+            <label className="toggle">
+              <span>Alert sound</span>
+              <input
+                type="checkbox"
+                aria-label="Alert sound"
+                checked={rt.snap?.alertSound !== false}
+                onChange={(e) => {
+                  if (!rt.snap) return;
+                  rt.snap.alertSound = e.target.checked;
+                  rt.bump();
+                }}
+              />
+            </label>
+            <p className="note">Quiet hours mute the phone notice, the ring, and the alert on this page. Messages still arrive. These hours stay on this device. The website notice still arrives if this browser allowed it, because the box does not learn the hours.</p>
             <label>Quiet from <input type="time" aria-label="Quiet from" value={clockOfMinutes(rt.snap?.quietStartMin)} onChange={(e) => { if (!rt.snap) return; rt.snap.quietStartMin = minutesOfClock(e.target.value); rt.bump(); }} /></label>
             <label> until <input type="time" aria-label="Quiet until" value={clockOfMinutes(rt.snap?.quietEndMin)} onChange={(e) => { if (!rt.snap) return; rt.snap.quietEndMin = minutesOfClock(e.target.value); rt.bump(); }} /></label>
             <button type="button" className="ghost" onClick={() => void rt.enablePush().then((note) => alert(note)).catch((e) => alert((e as Error).message))}>

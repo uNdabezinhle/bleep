@@ -108,6 +108,29 @@ class ProtocolTest {
     }
 
     @Test
+    fun mailAlertSkipsAVoteACallAndQuietHours() {
+        assertTrue(Alerts.mail("text"))
+        assertTrue(Alerts.mail("photo"))
+        assertTrue(Alerts.mail("poll"))
+        assertTrue(Alerts.mail("poll-close"))
+        assertTrue(Alerts.mail("intro"))
+        assertTrue(Alerts.mail("ctrl", op = "screen-capture"))
+        assertTrue(Alerts.mail("ctrl", op = "status"))
+        assertTrue(Alerts.mail("ctrl", op = "profile"))
+        assertTrue(Alerts.mail("ctrl", op = "leave-group"))
+        assertFalse(Alerts.mail("typing"))
+        assertFalse(Alerts.mail("receipt"))
+        assertFalse(Alerts.mail("react"))
+        assertFalse(Alerts.mail("vote"))
+        assertFalse(Alerts.mail("call", phase = "offer"))
+        assertFalse(Alerts.mail("call", phase = "ice"))
+        assertFalse(Alerts.mail("ctrl", op = "delete"))
+        assertFalse(Alerts.mail("location"))
+        assertFalse(Alerts.mail("text", quiet = true, enabled = true))
+        assertFalse(Alerts.mail("text", enabled = false))
+    }
+
+    @Test
     fun ringNoticeHasNoPeerField() {
         val note = ringNotice()
         assertEquals("Bleep", note.title)

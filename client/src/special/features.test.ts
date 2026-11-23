@@ -9,6 +9,7 @@ import {
   mergeStar,
   RING_TEXT,
   RING_TITLE,
+  shouldAlert,
   takeDue,
   tally,
   type LaterItem,
@@ -70,6 +71,28 @@ describe("special features", () => {
       { question: "Lunch?", options: ["Yes", "No"], votes: { aa: 1, bb: 0 } },
     );
     expect(merged?.votes).toEqual({ aa: 1, bb: 0 });
+  });
+
+  it("alerts for new mail and stays quiet for a vote, a call, and quiet hours", () => {
+    expect(shouldAlert("text", { enabled: true })).toBe(true);
+    expect(shouldAlert("photo")).toBe(true);
+    expect(shouldAlert("poll")).toBe(true);
+    expect(shouldAlert("poll-close")).toBe(true);
+    expect(shouldAlert("intro")).toBe(true);
+    expect(shouldAlert("ctrl", { op: "screen-capture" })).toBe(true);
+    expect(shouldAlert("ctrl", { op: "status" })).toBe(true);
+    expect(shouldAlert("ctrl", { op: "profile" })).toBe(true);
+    expect(shouldAlert("ctrl", { op: "leave-group" })).toBe(true);
+    expect(shouldAlert("typing")).toBe(false);
+    expect(shouldAlert("receipt")).toBe(false);
+    expect(shouldAlert("react")).toBe(false);
+    expect(shouldAlert("vote")).toBe(false);
+    expect(shouldAlert("call", { phase: "offer" })).toBe(false);
+    expect(shouldAlert("call", { phase: "ice" })).toBe(false);
+    expect(shouldAlert("ctrl", { op: "delete" })).toBe(false);
+    expect(shouldAlert("location")).toBe(false);
+    expect(shouldAlert("text", { quiet: true, enabled: true })).toBe(false);
+    expect(shouldAlert("text", { enabled: false })).toBe(false);
   });
 
   it("uses a fixed ring notice with no peer field", () => {

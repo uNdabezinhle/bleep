@@ -603,9 +603,14 @@ fun MePane(session: Session, bump: () -> Unit, onPin: (String) -> Unit, onErased
             bump()
         }) { Text(if (session.listenBackground) "Stop listening" else "Listen in the background", color = Amber) }
         Text("Checks for mail about every 20 seconds while Bleep stays in the background. The notice says Bleep. It does not include the message or the sender. Listening stops if the phone stops the app. A call rings on this phone while Bleep is listening. It does not ring after the app is stopped.", color = Mute, fontSize = 12.sp)
+        Text("Alert sound plays on this phone. It does not say who sent the message.", color = Mute, fontSize = 12.sp)
+        TextButton(onClick = {
+            session.alertSound = !session.alertSound
+            bump()
+        }) { Text(if (session.alertSound) "Alert sound on" else "Alert sound off", color = Amber) }
         var quietFrom by remember { mutableStateOf(QuietHours.clock(session.quietStartMin)) }
         var quietUntil by remember { mutableStateOf(QuietHours.clock(session.quietEndMin)) }
-        Text("Quiet hours mute the notice and the ring. Messages still arrive. These hours stay on this phone.", color = Mute, fontSize = 12.sp)
+        Text("Quiet hours silence the alert and the ring. Messages still arrive. These hours stay on this phone.", color = Mute, fontSize = 12.sp)
         Field("Quiet from", quietFrom) { quietFrom = it }
         Field("Quiet until", quietUntil) { quietUntil = it }
         TextButton(onClick = {

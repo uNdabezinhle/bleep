@@ -39,7 +39,8 @@ import { applyLeave } from "./history/groups";
 import { foldSharedHistory, keptKey, peerKeyReady, type LooseMsg } from "./history/share";
 import { OTHER_DEVICE, conflictStep, isRatchetDump, mergeSharedDumps, x3dhChoice } from "./history/sessionLock";
 import type { SerializedRatchet } from "./protocol/ratchet";
-import { applyVote, closePoll, enqueueLater, takeDue, type PollState } from "./special/features";
+import { applyVote, closePoll, enqueueLater, inQuietHours, shouldAlert, takeDue, type PollState } from "./special/features";
+import { playMailTone } from "./special/alertSound";
 
 
 export type UiNotice = { kind: "error" | "info" | "region"; text: string };
@@ -114,6 +115,9 @@ export class Runtime {
   presence: Record<string, { online: boolean; lastSeen: string | null }> = {};
   private callTimer: number | null = null;
   private labelsReady = false;
+  private alertPending = false;
+  /** True when the browser blocked the mail tone. */
+  alertBlocked = false;
 
   async boot(): Promise<"setup" | "lock" | "app"> {
     await this.vault.open();
@@ -843,6 +847,7 @@ export class Runtime {
     if (!this.token || !this.snap || this.locked) return;
     try {
       await this.flushLater();
+      this.alertPending = false;
       const items = (await api.fetch(this.token)) as { id: string; blob_b64: string }[];
       const ack: string[] = [];
       for (const it of items) {
@@ -876,6 +881,7 @@ export class Runtime {
       await this.liftShortIds();
       await this.flushOutbox();
       this.sweepDisappearing();
+      this.playAlert();
       this.bump();
     } catch (e) {
       if (e instanceof RegionMismatch) {
@@ -921,7 +927,7 @@ export class Runtime {
     if (peer.blocked) return true;
 
     if (inc.payload.kind === "poll" || inc.payload.kind === "vote" || inc.payload.kind === "poll-close") {
-      this.ingestPoll(mailboxId, inc.payload);
+      if (this.ingestPoll(mailboxId, inc.payload)) this.noteAlert(inc.payload.kind);
       return true;
     }
 
@@ -941,6 +947,7 @@ export class Runtime {
         groupName: inc.payload.groupName,
       };
       this.snap.requests.push(msg);
+      this.noteAlert("intro");
       return true;
     }
 
@@ -986,6 +993,7 @@ export class Runtime {
         text: "Their phone reported a screen capture. A photo of the screen is not attached, and a different app can stay silent.",
         at: Date.now(),
       });
+      this.noteAlert("ctrl", { op: "screen-capture" });
       this.bump();
       return true;
     }
@@ -1008,6 +1016,7 @@ export class Runtime {
         at: Date.now(),
         until: data.until ?? Date.now() + 86_400_000,
       });
+      this.noteAlert("ctrl", { op: "status" });
       this.bump();
       return true;
     }
@@ -1023,6 +1032,7 @@ export class Runtime {
         void this.vault.putAttachment(id, b64d(data.bytesB64), data.mime || "image/jpeg");
         stored.avatarId = id;
       }
+      this.noteAlert("ctrl", { op: "profile" });
       this.bump();
       return true;
     }
@@ -1059,6 +1069,7 @@ export class Runtime {
           text: "They left.",
           at: Date.now(),
         });
+        this.noteAlert("ctrl", { op: "leave-group" });
       }
       return true;
     }
@@ -1100,6 +1111,7 @@ export class Runtime {
           text: p.text,
           at: Date.now(),
         });
+        this.noteAlert(p.kind);
         return true;
       }
       const th = ensureDmThread(this.snap, peer);
@@ -1144,12 +1156,14 @@ export class Runtime {
       const inboundChamber = "chamber" in p && p.chamber === true;
       if (inboundGroup && !this.snap.groups[inboundGroup]) {
         this.snap.requests.push({ ...msg, threadId: "requests", groupId: inboundGroup, fromMailbox: mailboxId });
+        this.noteAlert(p.kind);
         return true;
       }
       if (inboundChamber) {
         const chamberThread = Object.values(this.snap.threads).find((t) => t.kind === "chamber" && t.peerMailboxId === mailboxId);
         if (!chamberThread) {
           this.snap.requests.push({ ...msg, threadId: "requests", chamberInvite: true, fromMailbox: mailboxId });
+          this.noteAlert(p.kind);
           return true;
         }
         msg.threadId = chamberThread.id;
@@ -1168,6 +1182,7 @@ export class Runtime {
         });
       }
       appendMsg(this.snap, msg);
+      this.noteAlert(p.kind);
       const home = this.snap.threads[msg.threadId];
       if (home && home.kind !== "chamber" && home.receipts && !msg.fromMe && this.token) {
         void this.seal(peer, {
@@ -1590,13 +1605,30 @@ export class Runtime {
     }
   }
 
-  private ingestPoll(mailboxId: string, payload: Extract<Payload, { kind: "poll" | "vote" | "poll-close" }>): void {
-    if (!this.snap) return;
+  private noteAlert(kind: string, extra?: { phase?: string; op?: string }): void {
+    if (shouldAlert(kind, extra)) this.alertPending = true;
+  }
+
+  private playAlert(): void {
+    if (!this.alertPending || !this.snap || this.locked) return;
+    const now = new Date();
+    const quiet = inQuietHours(this.snap.quietStartMin, this.snap.quietEndMin, now.getHours() * 60 + now.getMinutes());
+    if (!shouldAlert("text", { quiet, enabled: this.snap.alertSound !== false })) return;
+    void playMailTone().then((ok) => {
+      if (this.alertBlocked === ok) {
+        this.alertBlocked = !ok;
+        this.bump();
+      }
+    });
+  }
+
+  private ingestPoll(mailboxId: string, payload: Extract<Payload, { kind: "poll" | "vote" | "poll-close" }>): boolean {
+    if (!this.snap) return false;
     const groupId = payload.groupId;
     const group = this.snap.groups[groupId];
-    if (!group) return;
+    if (!group) return false;
     const members = group.members.map((m) => m.mailboxId);
-    if (!members.includes(mailboxId)) return;
+    if (!members.includes(mailboxId)) return false;
     const threadId = "g:" + groupId;
     if (payload.kind === "poll") {
       const poll: PollState = { question: payload.question, options: payload.options, votes: {} };
@@ -1611,18 +1643,20 @@ export class Runtime {
         poll,
         groupId,
       });
-      return;
+      return true;
     }
     const msg = (this.snap.messages[threadId] ?? []).find((m) => m.id === payload.pollId);
-    if (!msg?.poll) return;
+    if (!msg?.poll) return false;
     if (payload.kind === "vote") {
       const next = applyVote(msg.poll, mailboxId, payload.option, members);
       if (next) msg.poll = next;
-      return;
+      return false;
     }
     const author = msg.fromMailbox || (msg.fromMe ? this.snap.identity.mailboxId : "");
     const next = closePoll(msg.poll, mailboxId, author);
-    if (next) msg.poll = next;
+    if (!next) return false;
+    msg.poll = next;
+    return true;
   }
 
   async deleteForEveryone(thread: Thread, msg: Message): Promise<void> {

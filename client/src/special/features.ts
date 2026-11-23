@@ -87,6 +87,20 @@ export function tally(poll: PollState): number[] {
   return counts;
 }
 
+const MAIL_KINDS = new Set(["text", "photo", "voice", "file", "intro", "poll", "poll-close"]);
+const MAIL_OPS = new Set(["screen-capture", "status", "profile", "leave-group"]);
+
+/** True when this device should play the mail alert. A call offer is not mail. */
+export function shouldAlert(
+  kind: string,
+  opts?: { phase?: string; op?: string; quiet?: boolean; enabled?: boolean },
+): boolean {
+  if (opts?.quiet || opts?.enabled === false) return false;
+  if (kind === "call" || kind === "typing" || kind === "receipt" || kind === "react" || kind === "vote") return false;
+  if (kind === "ctrl") return MAIL_OPS.has(opts?.op || "");
+  return MAIL_KINDS.has(kind);
+}
+
 export function mergeStar(a?: boolean, b?: boolean, deleted?: boolean): boolean {
   if (deleted) return false;
   return Boolean(a || b);

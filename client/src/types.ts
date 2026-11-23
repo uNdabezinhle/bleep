@@ -146,6 +146,8 @@ export type VaultSnapshot = {
   /** Minutes from midnight. Not sent to the relay. */
   quietStartMin?: number | null;
   quietEndMin?: number | null;
+  /** Mail alert on this device. Missing means on. Not sent to the relay. */
+  alertSound?: boolean;
 };
 
 export type StatusItem = {
