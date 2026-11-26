@@ -92,6 +92,17 @@ def test_device_history_directory_erase():
         assert bad.status_code == 401
         named = c.put("/v1/handles", json={"handle": "ada"}, headers=auth(one["token"]))
         assert named.status_code == 200, named.text
+        for identifier in ("ada", "@ADA"):
+            login = c.post(
+                "/v1/accounts/login",
+                json={"email": identifier, "password": "password1"},
+                headers=HDR,
+            )
+            assert login.status_code == 200, login.text
+            assert login.json()["mailbox_id"] == reg["mailbox_id"]
+            assert login.json()["email"] == "ada@example.com"
+        wrong = c.post("/v1/accounts/login", json={"email": "ada", "password": "wrong-password"}, headers=HDR)
+        assert wrong.status_code == 401
         found = c.get("/v1/directory", params={"q": "ad"}, headers=auth(one["token"]))
         assert found.status_code == 200, found.text
         hit = found.json()[0]

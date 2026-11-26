@@ -190,20 +190,26 @@ export class Runtime {
     return account.detail;
   }
 
-  async signIn(email: string, password: string, recovery: string, pin: string): Promise<void> {
-    const account = (await api.loginAccount(email, password)) as { account_token: string; mailbox_id: string | null; email_confirmed: boolean; setup_pending?: boolean };
+  async authenticateSignIn(identifier: string, password: string) {
+    const account = (await api.loginAccount(identifier, password)) as {
+      account_token: string; mailbox_id: string | null; email_confirmed: boolean; setup_pending?: boolean; email?: string;
+    };
     if (!account.email_confirmed) throw new Error("Confirm your email before opening the vault.");
+    if (!account.mailbox_id && !account.setup_pending) throw new Error("This account has no active mailbox.");
+    return { ...account, email: account.email ?? identifier };
+  }
+
+  async finishSignIn(account: Awaited<ReturnType<Runtime["authenticateSignIn"]>>, recovery: string, pin: string): Promise<void> {
     if (!account.mailbox_id) {
-      if (!account.setup_pending) throw new Error("This account has no active mailbox.");
       const seed = recovery.trim() ? parseRecovery(recovery) : freshRecoverySeed();
-      await this.enroll(identityFromSeed("me", seed), account.account_token, email, seed, pin, true);
+      await this.enroll(identityFromSeed("me", seed), account.account_token, account.email, seed, pin, true);
       return;
     }
     if (!recovery.trim()) throw new Error("Enter your recovery code to open this account on a new device.");
     const seed = parseRecovery(recovery);
     const id = identityFromSeed("me", seed);
     if (id.mailboxId !== account.mailbox_id) throw new Error("Recovery code does not match this account.");
-    await this.enroll(id, account.account_token, email, seed, pin, false);
+    await this.enroll(id, account.account_token, account.email, seed, pin, false);
   }
 
   private async enroll(

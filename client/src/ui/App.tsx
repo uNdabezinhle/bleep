@@ -453,6 +453,9 @@ function RegisterFlow({
   const [name, setName] = useState("");
   const [pin, setPin] = useState("");
   const [recovery, setRecovery] = useState("");
+  const [signInAccount, setSignInAccount] = useState<Awaited<ReturnType<typeof rt.authenticateSignIn>> | null>(null);
+  const [restoreVault, setRestoreVault] = useState(false);
+  const needsRestore = Boolean(signInAccount?.mailbox_id) && !restoreVault;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
@@ -467,8 +470,8 @@ function RegisterFlow({
 
   return (
     <div className="screen invite-screen">
-      <div className="invite">
-        <Features />
+      <div className={mode === "signin" ? "signin-panel" : "invite"}>
+        {mode !== "signin" && <Features />}
         <form
           className="card"
           onSubmit={async (e) => {
@@ -486,7 +489,12 @@ function RegisterFlow({
               }
               if (mode === "signin") {
                 if (hasVault) throw new Error("This browser profile already has a vault. Open Bleep, or use another ?p= profile.");
-                await rt.signIn(email, password, recovery, pin);
+                if (!signInAccount) {
+                  setSignInAccount(await rt.authenticateSignIn(email, password));
+                  setPassword("");
+                  return;
+                }
+                await rt.finishSignIn(signInAccount, recovery, pin);
                 onDone();
                 return;
               }
@@ -509,15 +517,18 @@ function RegisterFlow({
           }}
         >
           <div className="chip">ZA-JHB</div>
-          <h1>{mode === "signin" ? "Sign in" : mode === "reset" ? "New password" : "Create an account"}</h1>
-          {mode !== "reset" && (
+          <h1>{needsRestore ? "Signed in" : signInAccount ? "Set up this device" : mode === "signin" ? "Sign in" : mode === "reset" ? "New password" : "Create an account"}</h1>
+          {mode !== "reset" && !signInAccount && (
             <>
-              <label>Email</label>
-              <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" required />
+              <label htmlFor="account-identifier">{mode === "signin" ? "Email or username" : "Email"}</label>
+              <input id="account-identifier" value={email} onChange={(e) => setEmail(e.target.value)} type={mode === "signin" ? "text" : "email"} autoComplete={mode === "signin" ? "username" : "email"} autoCapitalize="none" required />
+              {mode === "signin" && <p className="note">Use your email or published Bleep handle.</p>}
             </>
           )}
-          <label>{mode === "reset" ? "New password" : "Password"}</label>
-          <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" minLength={8} required />
+          {!signInAccount && <>
+            <label htmlFor="account-password">{mode === "reset" ? "New password" : "Password"}</label>
+            <input id="account-password" value={password} onChange={(e) => setPassword(e.target.value)} type="password" autoComplete={mode === "signin" ? "current-password" : "new-password"} minLength={8} required />
+          </>}
           {mode === "create" && (
             <>
               <label>Password again</label>
@@ -526,33 +537,39 @@ function RegisterFlow({
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Lebo" />
             </>
           )}
-          {mode !== "reset" && (
+          {needsRestore && <p className="note">To use this account on this device, restore your existing vault.</p>}
+          {(mode === "create" || (signInAccount && !needsRestore)) && (
             <>
               <label>Bleep lock PIN</label>
               <input value={pin} onChange={(e) => setPin(e.target.value)} type="password" minLength={4} required />
             </>
           )}
-          {mode === "signin" && (
+          {signInAccount?.mailbox_id && restoreVault && (
             <>
               <label>Recovery code</label>
-              <textarea value={recovery} onChange={(e) => setRecovery(e.target.value)} rows={2} />
+              <textarea aria-label="Recovery code" value={recovery} onChange={(e) => setRecovery(e.target.value)} rows={2} required />
               <p className="note">The code opens the key and the sealed history. The password alone does not.</p>
             </>
           )}
           {mode === "create" && <p className="note">Save your recovery code later from You → Account recovery.</p>}
           {err && <p className="warn">{err}</p>}
           {notice && <p className="note">{notice}</p>}
-          <button className="primary" disabled={busy}>{busy ? "Working…" : mode === "signin" ? "Open vault" : mode === "reset" ? "Update password" : "Create account"}</button>
+          {needsRestore ? (
+            <button type="button" className="primary" onClick={() => setRestoreVault(true)}>Restore existing chats</button>
+          ) : (
+            <button className="primary" disabled={busy}>{busy ? "Working…" : signInAccount ? "Open vault" : mode === "signin" ? "Sign in" : mode === "reset" ? "Update password" : "Create account"}</button>
+          )}
+          {signInAccount && <button type="button" className="ghost" disabled={busy} onClick={() => { setSignInAccount(null); setRestoreVault(false); setRecovery(""); setPin(""); setErr(""); }}>Back to sign in</button>}
           {mode === "create" && <button type="button" className="ghost" onClick={() => { setMode("signin"); accountPath("signin"); }}>Sign in</button>}
-          {mode === "signin" && <button type="button" className="ghost" onClick={() => { setMode("create"); accountPath("create"); }}>Create an account</button>}
-          {mode !== "reset" && (
+          {mode === "signin" && !signInAccount && <button type="button" className="ghost" disabled={busy} onClick={() => { setMode("create"); accountPath("create"); }}>Create an account</button>}
+          {mode !== "reset" && !signInAccount && (
             <button
               type="button"
               className="ghost"
               onClick={async () => {
                 setErr("");
                 setNotice("");
-                if (!email.trim()) {
+                if (!email.trim().includes("@") || email.trim().startsWith("@")) {
                   setErr("Enter the email on the account.");
                   return;
                 }

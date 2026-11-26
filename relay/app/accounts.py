@@ -26,7 +26,7 @@ from .crypto import auth_message, verify_ed25519
 from .db import get_session
 from .models import Account, ConfirmToken, Device, Envelope, HistoryBlob, HistoryExtra, HistoryFile, Mailbox, OneTimePrekey, ResetToken
 from .rate import check
-from .util import client_ip, hour_band, new_id, require_region, utcnow, valid_mailbox_id
+from .util import HANDLE_RE, client_ip, hour_band, new_id, require_region, utcnow, valid_mailbox_id
 
 router = APIRouter()
 _ph = PasswordHasher()
@@ -214,8 +214,16 @@ async def login_account(
     _region: str = Depends(require_region),
 ):
     check(f"login:{client_ip(request)}", 30, window=600)
-    email = _email(body.email)
-    row = await session.scalar(select(Account).where(Account.email == email))
+    identifier = body.email.strip().lower()
+    handle = identifier.removeprefix("@")
+    if HANDLE_RE.fullmatch(handle):
+        row = await session.scalar(
+            select(Account)
+            .join(Mailbox, Mailbox.account_id == Account.id)
+            .where(Mailbox.handle == handle, Mailbox.unlink_dead.is_(False))
+        )
+    else:
+        row = await session.scalar(select(Account).where(Account.email == _email(identifier)))
     if not row:
         raise HTTPException(status_code=401, detail=SAME_LOGIN)
     try:
@@ -228,6 +236,7 @@ async def login_account(
         "account_id": row.id,
         "account_token": mint_account_token(row.id),
         "mailbox_id": box.id if box else None,
+        "email": row.email,
         "setup_pending": row.email_confirmed and prior_mailbox is None,
         "email_confirmed": row.email_confirmed,
     }
