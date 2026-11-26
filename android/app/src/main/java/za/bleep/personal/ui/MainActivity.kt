@@ -35,6 +35,21 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.IconButton
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.ui.Alignment
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -434,10 +449,10 @@ fun AppPane(session: Session, tick: Int, bump: () -> Unit, onLock: () -> Unit, o
     @Suppress("UNUSED_EXPRESSION")
     tick
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth()) {
-            listOf("me", "chats", "requests", "report").forEach { t ->
+        if (peer == null && groupId == null && chamberId == null) Row(Modifier.fillMaxWidth()) {
+            listOf("chats" to "Chats", "requests" to "Requests", "report" to "Guardian", "me" to "You").forEach { (t, label) ->
                 TextButton(onClick = { tab = t; peer = null; groupId = null; chamberId = null }) {
-                    Text(t.uppercase(), color = if (tab == t && peer == null && groupId == null && chamberId == null) Amber else Mute, fontSize = 11.sp)
+                    Text(label, color = if (tab == t) Amber else Mute, fontSize = 11.sp)
                 }
             }
             TextButton(onClick = onLock) { Text("LOCK", color = Mute, fontSize = 11.sp) }
@@ -1313,8 +1328,12 @@ fun ThreadPane(
             items(msgs.reversed()) { m ->
                 val bg = if (m.fromMe) Color(0xFF203D60) else Paper
                 val hidden = m.viewOnce && !m.fromMe && !m.viewed && !m.deleted
+                BoxWithConstraints(
+                    Modifier.fillMaxWidth(),
+                    contentAlignment = if (m.fromMe) Alignment.CenterEnd else Alignment.CenterStart,
+                ) {
                 Column(
-                    Modifier.padding(6.dp).background(bg, RoundedCornerShape(12.dp)).padding(10.dp)
+                    Modifier.widthIn(max = maxWidth * 0.85f).padding(6.dp).background(bg, RoundedCornerShape(12.dp)).padding(10.dp)
                         .pointerInput(m.id, hidden, m.viewed) {
                             detectTapGestures(
                                 onLongPress = { reply = m },
@@ -1381,11 +1400,25 @@ fun ThreadPane(
                         }
                         if (m.viewOnce && m.viewed && !m.fromMe) Text("Capture is still possible.", color = Mute, fontSize = 12.sp)
                     }
-                    Row {
-                        TextButton(onClick = { session.toggleStar(threadKey, m.id); bump() }) { Text(if (m.starred) "★" else "☆", color = Amber, fontSize = 12.sp) }
-                        TextButton(onClick = { reply = m }) { Text("Reply", color = Mute, fontSize = 12.sp) }
-                        TextButton(onClick = { session.hideForMe(threadKey, m.id); bump() }) { Text("×", color = Mute, fontSize = 12.sp) }
+                    Box(Modifier.align(Alignment.End)) {
+                        var expanded by remember(m.id) { mutableStateOf(false) }
+                        TextButton(onClick = { expanded = true }) { Text("Actions ⋯", color = Mute, fontSize = 12.sp) }
+                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                            DropdownMenuItem(
+                                text = { Text(if (m.starred) "Unstar" else "Star") },
+                                onClick = { expanded = false; session.toggleStar(threadKey, m.id); bump() },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Reply") },
+                                onClick = { expanded = false; reply = m },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Delete for me") },
+                                onClick = { expanded = false; session.hideForMe(threadKey, m.id); bump() },
+                            )
+                        }
                     }
+                }
                 }
             }
         }
@@ -1430,11 +1463,13 @@ fun ThreadPane(
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            TextButton(onClick = { viewOnce = !viewOnce }) {
-                Text(if (viewOnce) "Open once on" else "Open once", color = if (viewOnce) Amber else Mute)
+            IconButton(onClick = { viewOnce = !viewOnce }) {
+                ActionIcon(if (viewOnce) "Turn off open once" else "Turn on open once", "M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12z M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z", if (viewOnce) Amber else Mute)
             }
-            TextButton(onClick = { pick.launch("*/*") }) { Text("+", color = Amber, fontSize = 20.sp) }
-            TextButton(onClick = {
+            IconButton(onClick = { pick.launch("*/*") }) {
+                ActionIcon("Attach file", "M21 11l-9 9a5 5 0 0 1-7-7l9-9a3 3 0 0 1 4 4l-9 9a1 1 0 0 1-2-2l8-8", Amber)
+            }
+            IconButton(onClick = {
                 if (recording) {
                     try { recorder?.stop(); recorder?.release() } catch (_: Exception) {}
                     recorder = null; recording = false
@@ -1450,10 +1485,26 @@ fun ThreadPane(
                         }
                     }
                 } else mic.launch(Manifest.permission.RECORD_AUDIO)
-            }) { Text(if (recording) "■" else "●", color = if (recording) Bad else Amber) }
+            }) {
+                if (recording) ActionIcon("Stop and send voice note", "M6 6h12v12H6z", Bad)
+                else ActionIcon("Record voice note", "M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z M19 11a7 7 0 0 1-14 0 M12 18v3", Amber)
+            }
+            if (chamberId == null) {
+                IconButton(onClick = { showLater = !showLater }) {
+                    ActionIcon("Send later", "M12 8v5l3 2 M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", if (showLater) Amber else Mute)
+                }
+            }
+            if (groupId != null) {
+                IconButton(onClick = { showPoll = !showPoll }) {
+                    ActionIcon("Create poll", "M4 20h16 M6 16v-5 M12 16V4 M18 16V8", if (showPoll) Amber else Mute)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             OutlinedTextField(
                 text, { text = it },
                 modifier = Modifier.weight(1f),
+                placeholder = { Text("Message") },
                 colors = fieldColors(),
             )
             Button(
@@ -1472,13 +1523,7 @@ fun ThreadPane(
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = Amber, contentColor = Ink),
-            ) { Text("Send") }
-            if (chamberId == null) {
-                TextButton(onClick = { showLater = !showLater }) { Text("Send later", color = Mute, fontSize = 12.sp) }
-            }
-            if (groupId != null) {
-                TextButton(onClick = { showPoll = !showPoll }) { Text("Poll", color = Mute, fontSize = 12.sp) }
-            }
+            ) { ActionIcon("Send message", "M22 2L11 13 M22 2l-7 20-4-9-9-4 20-7", Ink) }
         }
         if (showLater && chamberId == null) {
             Text("Sends while Bleep is open, or while this phone is listening. Otherwise it sends the next time you open Bleep. The relay does not see it early.", color = Mute, fontSize = 12.sp)
@@ -1928,6 +1973,16 @@ fun lockLabel(sec: Int): String = when (sec) {
     900 -> "15 minutes"
     3600 -> "1 hour"
     else -> "$sec seconds"
+}
+
+@Composable
+private fun ActionIcon(label: String, pathData: String, color: Color) {
+    val path = remember(pathData) { PathParser().parsePathString(pathData).toPath() }
+    Canvas(Modifier.size(22.dp).semantics { contentDescription = label }) {
+        scale(size.width / 24f, size.height / 24f, pivot = androidx.compose.ui.geometry.Offset.Zero) {
+            drawPath(path, color, style = Stroke(width = 1.8f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        }
+    }
 }
 
 @Composable

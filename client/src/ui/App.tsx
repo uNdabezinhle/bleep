@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import jsQR from "jsqr";
 import { api } from "../net/api";
@@ -869,6 +869,7 @@ function ThreadView({
             <button type="button" aria-label="Cancel reply" onClick={() => { thread.replyTo = undefined; thread.replyText = undefined; rt.bump(); }}>×</button>
           </div>
         )}
+        <div className="composer-tools">
         <label className="iconbtn" title="Photo or file" aria-label="Photo or file">
           <Icon d={ICON.clip} />
           <input
@@ -940,7 +941,9 @@ function ThreadView({
           <Icon d={ICON.eye} />
         </button>
         {thread.kind === "dm" && peer && <LiveLocation thread={thread} />}
-        <textarea
+        </div>
+        <div className="composer-entry">
+        <DraftTextarea
           rows={1}
           placeholder="Message"
           value={text}
@@ -949,19 +952,22 @@ function ThreadView({
             rt.sendTyping(thread);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               void send();
             }
           }}
         />
         <button className="iconbtn primary" aria-label="Send" onClick={() => void send()}><Icon d={ICON.send} /></button>
+        </div>
+        <div className="composer-tools">
         {(thread.kind === "dm" || thread.kind === "group") && (
           <button type="button" className="ghost" onClick={() => setLaterOpen((v) => !v)}>Send later</button>
         )}
         {thread.kind === "group" && (
           <button type="button" className="ghost" onClick={() => setPollOpen((v) => !v)}>Poll</button>
         )}
+        </div>
       </div>}
       {laterOpen && (thread.kind === "dm" || thread.kind === "group") && (
         <div className="replybar">
@@ -1155,11 +1161,11 @@ function Bubble({
   if (msg.kind === "system") return <div className="bubble sys">{msg.text}</div>;
   const onBody = (target: EventTarget | null) => {
     const el = target as HTMLElement | null;
-    return !el?.closest("button, a, audio, video, input");
+    return !el?.closest("button, a, audio, video, input, summary");
   };
   return (
     <div
-      className={"bubble" + (mine ? " me" : "")}
+      className={"bubble" + (mine ? " me" : "") + (msg.kind === "voice" && url && !msg.deleted ? " voice" : "")}
       title="Press and hold to reply"
       onContextMenu={(e) => {
         e.preventDefault();
@@ -1235,6 +1241,27 @@ function Bubble({
       </div>
     </div>
   );
+}
+
+function DraftTextarea(props: React.ComponentPropsWithoutRef<"textarea">) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const field = ref.current!;
+    const fit = () => {
+      field.style.height = "0px";
+      field.style.height = `${field.scrollHeight + field.offsetHeight - field.clientHeight}px`;
+    };
+    fit();
+    let width = field.offsetWidth;
+    const observer = new ResizeObserver(() => {
+      if (width === field.offsetWidth) return;
+      width = field.offsetWidth;
+      fit();
+    });
+    observer.observe(field);
+    return () => observer.disconnect();
+  }, [props.value]);
+  return <textarea {...props} ref={ref} aria-label="Message" />;
 }
 
 function MediaGrid({ msgs, onClose }: { msgs: Message[]; onClose: () => void }) {
