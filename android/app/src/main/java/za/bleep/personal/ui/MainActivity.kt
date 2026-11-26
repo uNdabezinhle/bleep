@@ -1866,6 +1866,7 @@ private fun CallSheet(call: PhoneCall, onAnswer: (Peer) -> Unit, onHangup: () ->
     val title = when (call.phase) {
         "active" -> "In call"
         "ringing-in" -> "Incoming call"
+        "ringing-out" -> "Ringing…"
         else -> "Calling…"
     }
     Column(Modifier.fillMaxWidth().padding(12.dp).background(Paper, RoundedCornerShape(12.dp)).padding(12.dp)) {

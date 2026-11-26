@@ -1110,7 +1110,7 @@ function CallOverlay() {
   return (
     <div className="sheet">
       <div className="panel call-panel">
-        <h3>{c.phase === "active" ? "In call" : c.phase === "ringing-in" ? "Incoming call" : "Calling…"}</h3>
+        <h3>{c.phase === "active" ? "In call" : c.phase === "ringing-in" ? "Incoming call" : c.phase === "ringing-out" ? "Ringing…" : "Calling…"}</h3>
         <p className="reason">{name} · {c.media} · signalling is sealed. TURN never sees a name.</p>
         {c.media === "audio" && <audio ref={audio} autoPlay />}
         {c.media === "video" && <video ref={video} autoPlay playsInline style={{ width: "100%", borderRadius: 8, background: "#000" }} />}
