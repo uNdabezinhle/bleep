@@ -952,7 +952,7 @@ function ThreadView({
             rt.sendTyping(thread);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) {
               e.preventDefault();
               void send();
             }
@@ -1224,8 +1224,17 @@ function Bubble({
       )}
       <div className="at">
         {fmtTime(msg.at)} {msg.reacted ?? ""} <Receipt status={msg.status} />
-        <details className="message-actions">
-          <summary aria-label="Message actions">⋯</summary>
+        <details className="message-actions" onKeyDown={(event) => {
+          if (event.key !== "Escape" || !event.currentTarget.open) return;
+          event.stopPropagation();
+          event.currentTarget.open = false;
+          event.currentTarget.querySelector("summary")?.focus();
+        }} onClick={(event) => {
+          if (!(event.target as Element).closest("button")) return;
+          event.currentTarget.open = false;
+          event.currentTarget.querySelector("summary")?.focus();
+        }}>
+          <summary aria-label="Message options" title="Message options">⋯</summary>
           <div>
         <button className="iconbtn tiny" aria-label={msg.starred ? "Unstar" : "Star"} onClick={onStar}>{msg.starred ? "★" : "☆"}</button>
         <button className="iconbtn tiny" aria-label="Reply" onClick={onReply}>↩</button>
