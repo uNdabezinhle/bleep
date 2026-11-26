@@ -117,6 +117,13 @@ export class Vault {
     return deserialize(data);
   }
 
+  async verifyPin(pin: string): Promise<void> {
+    const wrap = (await this.db.get("meta", "wrap")) as Wrap | undefined;
+    if (!wrap) throw new Error("No vault.");
+    const key = await derive(pin, b64d(wrap.salt));
+    await decryptJson<SerializedVault>(key, wrap.iv, wrap.ct);
+  }
+
   lock(): void {
     this.key = null;
   }

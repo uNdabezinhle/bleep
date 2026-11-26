@@ -7,6 +7,7 @@ import { disappearAction, disappearPhrase, muteAction, replySnippet } from "../c
 import { clockOfMinutes, minutesOfClock, tally } from "../special/features";
 import { unlockAlert } from "../special/alertSound";
 import { bleepCode, formatRecovery, formatShortId, freshRecoverySeed } from "../protocol/keys";
+import { b64d } from "../protocol/bytes";
 import { pairSafety } from "../session/session";
 import { navigate } from "../site/router";
 import { profileName } from "../store/vault";
@@ -452,8 +453,6 @@ function RegisterFlow({
   const [name, setName] = useState("");
   const [pin, setPin] = useState("");
   const [recovery, setRecovery] = useState("");
-  const [seed, setSeed] = useState<Uint8Array | null>(null);
-  const [kept, setKept] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [notice, setNotice] = useState("");
@@ -461,19 +460,10 @@ function RegisterFlow({
   useEffect(() => {
     if (!confirmToken) return;
     void api.confirmAccount(confirmToken).then(() => {
-      setNotice("Address confirmed. Sign in with the recovery code. The link did not contain it.");
+      setNotice("Address confirmed. Sign in to finish setting up your vault.");
       setMode("signin");
     }).catch((ex) => setErr((ex as Error).message));
   }, [confirmToken]);
-
-  const startSeed = () => {
-    setErr("");
-    if (password.length < 8) return setErr("Password should be 8 characters or more.");
-    if (password !== again) return setErr("Passwords do not match.");
-    if (pin.length < 4) return setErr("PIN should be 4 characters or more.");
-    if (!name.trim()) return setErr("Add a display name.");
-    setSeed(freshRecoverySeed());
-  };
 
   return (
     <div className="screen invite-screen">
@@ -500,12 +490,11 @@ function RegisterFlow({
                 onDone();
                 return;
               }
-              if (!seed) {
-                startSeed();
-                return;
-              }
-              if (!kept) throw new Error("Confirm that you have kept the recovery code.");
-              const detail = await rt.signUp(email, password, name, pin, seed);
+              if (password.length < 8) throw new Error("Password should be 8 characters or more.");
+              if (password !== again) throw new Error("Passwords do not match.");
+              if (pin.length < 4) throw new Error("PIN should be 4 characters or more.");
+              if (!name.trim()) throw new Error("Add a display name.");
+              const detail = await rt.signUp(email, password, name, pin, freshRecoverySeed());
               if (!rt.snap) {
                 setNotice(detail);
                 setMode("signin");
@@ -529,7 +518,7 @@ function RegisterFlow({
           )}
           <label>{mode === "reset" ? "New password" : "Password"}</label>
           <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" minLength={8} required />
-          {mode === "create" && !seed && (
+          {mode === "create" && (
             <>
               <label>Password again</label>
               <input value={again} onChange={(e) => setAgain(e.target.value)} type="password" required />
@@ -540,31 +529,22 @@ function RegisterFlow({
           {mode !== "reset" && (
             <>
               <label>Bleep lock PIN</label>
-              <input value={pin} onChange={(e) => setPin(e.target.value)} type="password" minLength={4} required={mode === "signin" || !seed} />
+              <input value={pin} onChange={(e) => setPin(e.target.value)} type="password" minLength={4} required />
             </>
           )}
           {mode === "signin" && (
             <>
               <label>Recovery code</label>
-              <textarea value={recovery} onChange={(e) => setRecovery(e.target.value)} rows={2} required />
+              <textarea value={recovery} onChange={(e) => setRecovery(e.target.value)} rows={2} />
               <p className="note">The code opens the key and the sealed history. The password alone does not.</p>
             </>
           )}
-          {seed && mode === "create" && (
-            <>
-              <p className="note">Write this down. It is shown once. A second device needs it. The relay never receives it.</p>
-              <div className="code">{formatRecovery(seed)}</div>
-              <label className="toggle">
-                <input type="checkbox" checked={kept} onChange={(e) => setKept(e.target.checked)} />
-                <span>I have kept this recovery code</span>
-              </label>
-            </>
-          )}
+          {mode === "create" && <p className="note">Save your recovery code later from You → Account recovery.</p>}
           {err && <p className="warn">{err}</p>}
           {notice && <p className="note">{notice}</p>}
-          <button className="primary" disabled={busy}>{busy ? "Working…" : mode === "signin" ? "Open vault" : mode === "reset" ? "Update password" : seed ? "Create account" : "Show recovery code"}</button>
+          <button className="primary" disabled={busy}>{busy ? "Working…" : mode === "signin" ? "Open vault" : mode === "reset" ? "Update password" : "Create account"}</button>
           {mode === "create" && <button type="button" className="ghost" onClick={() => { setMode("signin"); accountPath("signin"); }}>Sign in</button>}
-          {mode === "signin" && <button type="button" className="ghost" onClick={() => { setMode("create"); setSeed(null); accountPath("create"); }}>Create an account</button>}
+          {mode === "signin" && <button type="button" className="ghost" onClick={() => { setMode("create"); accountPath("create"); }}>Create an account</button>}
           {mode !== "reset" && (
             <button
               type="button"
@@ -1209,7 +1189,7 @@ function Bubble({
                 <button className="ghost" onClick={onOpenHeld}>Tap to open {msg.name || "file"}. Low Data waits until you ask. Public Bleep did not scan this in the cloud.</button>
               )}
               {!msg.needsDownload && msg.kind === "photo" && url && <img className="media" src={url} alt="" />}
-              {!msg.needsDownload && msg.kind === "voice" && url && <audio controls src={url} style={{ width: "100%" }} />}
+              {!msg.needsDownload && msg.kind === "voice" && url && <audio controls src={url} aria-label="Voice note" />}
               {!msg.needsDownload && msg.kind === "file" && <div className="t">File: {msg.name}</div>}
               {msg.kind === "call" && <div className="t">☎ {msg.text}</div>}
               {msg.kind === "poll" && msg.poll && (
@@ -1238,6 +1218,9 @@ function Bubble({
       )}
       <div className="at">
         {fmtTime(msg.at)} {msg.reacted ?? ""} <Receipt status={msg.status} />
+        <details className="message-actions">
+          <summary aria-label="Message actions">⋯</summary>
+          <div>
         <button className="iconbtn tiny" aria-label={msg.starred ? "Unstar" : "Star"} onClick={onStar}>{msg.starred ? "★" : "☆"}</button>
         <button className="iconbtn tiny" aria-label="Reply" onClick={onReply}>↩</button>
         <button className="iconbtn tiny" aria-label="React" onClick={() => onReact("👍")}>👍</button>
@@ -1247,6 +1230,8 @@ function Bubble({
             <Icon d={ICON.trash} />
           </button>
         )}
+          </div>
+        </details>
       </div>
     </div>
   );
@@ -1548,6 +1533,7 @@ function SettingsPane({ slide, onSlide, onErased }: { slide: number; onSlide: (i
             </>
           )}
           <AccountPin />
+          {slide === 1 && <RecoveryCode />}
         </section>
         <section>
           <div>
@@ -1763,6 +1749,53 @@ function AccountPassword() {
       </button>
       {note && <p className="note">{note}</p>}
       {err && <p className="warn">{err}</p>}
+    </section>
+  );
+}
+
+function RecoveryCode() {
+  const [pin, setPin] = useState("");
+  const [code, setCode] = useState("");
+  const [err, setErr] = useState("");
+  const attempt = useRef(0);
+  useEffect(() => {
+    const hide = () => {
+      if (document.hidden) {
+        attempt.current++;
+        setCode("");
+        setPin("");
+      }
+    };
+    document.addEventListener("visibilitychange", hide);
+    return () => {
+      attempt.current++;
+      document.removeEventListener("visibilitychange", hide);
+    };
+  }, []);
+  return (
+    <section>
+      <h3>Account recovery</h3>
+      {rt.snap?.settings.recoverySeed ? (
+        <form onSubmit={async (event) => {
+          event.preventDefault();
+          const request = ++attempt.current;
+          setErr("");
+          setCode("");
+          setPin("");
+          try {
+            await rt.vault.verifyPin(pin);
+            const seed = rt.snap?.settings.recoverySeed;
+            if (request === attempt.current && seed && !rt.locked && !document.hidden) setCode(formatRecovery(b64d(seed)));
+          } catch {
+            if (request === attempt.current) setErr("Could not verify your vault PIN.");
+          }
+        }}>
+          <label>Vault PIN <input type="password" autoComplete="off" value={pin} onChange={(event) => setPin(event.target.value)} required /></label>
+          <button className="ghost">Show recovery code</button>
+          {err && <p role="alert">{err}</p>}
+          {code && <div><div className="code">{code}</div><button type="button" className="ghost" onClick={() => setCode("")}>Hide recovery code</button></div>}
+        </form>
+      ) : <p className="note">Use an enrolled device that holds your recovery code.</p>}
     </section>
   );
 }

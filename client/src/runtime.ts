@@ -37,6 +37,7 @@ import { handleFromInput, peerLabel, publishedHandle, shortIdFromInput } from ".
 import { iceServers } from "./calls/ice";
 import { applyLeave } from "./history/groups";
 import { foldSharedHistory, keptKey, peerKeyReady, type LooseMsg } from "./history/share";
+import { freshRecoverySeed } from "./protocol/keys";
 import { OTHER_DEVICE, conflictStep, isRatchetDump, mergeSharedDumps, x3dhChoice } from "./history/sessionLock";
 import type { SerializedRatchet } from "./protocol/ratchet";
 import { applyVote, closePoll, enqueueLater, inQuietHours, shouldAlert, takeDue, type PollState } from "./special/features";
@@ -190,9 +191,16 @@ export class Runtime {
   }
 
   async signIn(email: string, password: string, recovery: string, pin: string): Promise<void> {
+    const account = (await api.loginAccount(email, password)) as { account_token: string; mailbox_id: string | null; email_confirmed: boolean; setup_pending?: boolean };
+    if (!account.email_confirmed) throw new Error("Confirm your email before opening the vault.");
+    if (!account.mailbox_id) {
+      if (!account.setup_pending) throw new Error("This account has no active mailbox.");
+      const seed = recovery.trim() ? parseRecovery(recovery) : freshRecoverySeed();
+      await this.enroll(identityFromSeed("me", seed), account.account_token, email, seed, pin, true);
+      return;
+    }
+    if (!recovery.trim()) throw new Error("Enter your recovery code to open this account on a new device.");
     const seed = parseRecovery(recovery);
-    const account = (await api.loginAccount(email, password)) as { account_token: string; mailbox_id: string | null };
-    if (!account.mailbox_id) throw new Error("This account has no mailbox yet.");
     const id = identityFromSeed("me", seed);
     if (id.mailboxId !== account.mailbox_id) throw new Error("Recovery code does not match this account.");
     await this.enroll(id, account.account_token, email, seed, pin, false);

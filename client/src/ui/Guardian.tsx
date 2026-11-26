@@ -141,7 +141,7 @@ export function GuardianReport({
             {devicesLoaded && rows.length === 0 && !deviceErr && <p className="note">No device rows loaded.</p>}
             {deviceErr && <p className="warn">Device list did not load.</p>}
           </div>
-          <p className="note">The recovery code was shown once at signup. It is not on this page. It is not on the relay.</p>
+          <p className="note">To see your recovery code, open Account recovery in You.</p>
         </section>
         <section>
           <CountTiles rows={counts} />

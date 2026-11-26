@@ -16,7 +16,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import Principal, consume_challenge, mint_account_token, mint_token, parse_account_token, require_mailbox
@@ -223,10 +223,12 @@ async def login_account(
     except VerifyMismatchError:
         raise HTTPException(status_code=401, detail=SAME_LOGIN) from None
     box = await session.scalar(select(Mailbox).where(Mailbox.account_id == row.id, Mailbox.unlink_dead.is_(False)))
+    prior_mailbox = box or await session.scalar(select(Mailbox.id).where(Mailbox.account_id == row.id).limit(1))
     return {
         "account_id": row.id,
         "account_token": mint_account_token(row.id),
         "mailbox_id": box.id if box else None,
+        "setup_pending": row.email_confirmed and prior_mailbox is None,
         "email_confirmed": row.email_confirmed,
     }
 
@@ -257,8 +259,10 @@ async def add_device(
     session: AsyncSession = Depends(get_session),
     _region: str = Depends(require_region),
 ):
+    # Serialize first-device enrollment, including on SQLite.
+    await session.execute(update(Account).where(Account.id == account_id).values(id=account_id))
     account = await session.get(Account, account_id)
-    if smtp_configured() and (not account or not account.email_confirmed):
+    if not account or not account.email_confirmed:
         raise HTTPException(status_code=403, detail="confirm email")
     valid_mailbox_id(body.mailbox_id)
     box = await session.get(Mailbox, body.mailbox_id)
@@ -266,6 +270,10 @@ async def add_device(
         raise HTTPException(status_code=401, detail="unknown mailbox")
     if box.account_id and box.account_id != account_id:
         raise HTTPException(status_code=409, detail="mailbox linked elsewhere")
+    if box.account_id is None:
+        linked = await session.scalar(select(Mailbox.id).where(Mailbox.account_id == account_id).limit(1))
+        if linked is not None:
+            raise HTTPException(status_code=409, detail="account already has a mailbox")
     try:
         sig = b64d(body.signature_b64)
     except Exception as exc:

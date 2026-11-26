@@ -81,11 +81,11 @@ import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 import java.io.File
 
-private val Ink = Color(0xFF101114)
-private val Paper = Color(0xFF17191F)
-private val Amber = Color(0xFFE0A94A)
-private val TextC = Color(0xFFECE8DF)
-private val Mute = Color(0xFF9A9488)
+private val Ink = Color(0xFF101827)
+private val Paper = Color(0xFF1B273A)
+private val Amber = Color(0xFF77BAFF)
+private val TextC = Color(0xFFF1F5FF)
+private val Mute = Color(0xFFB3C2D9)
 private val Bad = Color(0xFFD46767)
 
 class MainActivity : ComponentActivity() {
@@ -252,8 +252,6 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
     var recovery by remember { mutableStateOf("") }
     var resetToken by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("http://10.0.2.2:8090") }
-    var seed by remember { mutableStateOf<ByteArray?>(null) }
-    var kept by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf(errIn) }
     var notice by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -270,7 +268,7 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
         if (!confirm.isNullOrBlank()) {
             try {
                 withContext(Dispatchers.IO) { session.confirmAddress(confirm) }
-                notice = "Address confirmed. Sign in with the recovery code. The link did not contain it."
+                notice = "Address confirmed. Sign in to finish setting up your vault."
                 mode = "signin"
             } catch (e: Exception) {
                 err = e.message ?: "confirm failed"
@@ -290,20 +288,20 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
             color = TextC,
             fontSize = 26.sp,
         )
-        Text("The key is made on this phone. Email is the login. The recovery code is shown once and is not sent to the relay.", color = Mute)
+        Text("The key is made on this phone. Save your recovery code later from You → Account recovery.", color = Mute)
         if (mode != "reset") {
             Row {
-                TextButton(onClick = { mode = "signin"; seed = null }) {
+                TextButton(onClick = { mode = "signin" }) {
                     Text("Sign in", color = if (mode == "signin") Amber else Mute)
                 }
-                TextButton(onClick = { mode = "create"; seed = null }) {
+                TextButton(onClick = { mode = "create" }) {
                     Text("Create an account", color = if (mode == "create") Amber else Mute)
                 }
             }
         }
         if (mode != "reset") Field("Email", email) { email = it }
         Field(if (mode == "reset") "New password" else "Password", password, password = true) { password = it }
-        if (mode == "create" && seed == null) {
+        if (mode == "create") {
             Field("Password again", again, password = true) { again = it }
             Field("Display name", name) { name = it }
         }
@@ -314,13 +312,6 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
         }
         if (mode == "reset") Field("Reset token from the mail link", resetToken) { resetToken = it }
         Field("This box's URL", url) { url = it }
-        if (seed != null && mode == "create") {
-            Text("Write this down. It is shown once. A second device needs it. The relay never receives it.", color = Mute, fontSize = 13.sp)
-            Text(Crypto.formatRecovery(seed!!), color = Amber, fontFamily = FontFamily.Monospace)
-            TextButton(onClick = { kept = !kept }) {
-                Text(if (kept) "Recovery code kept" else "I have kept this recovery code", color = Amber)
-            }
-        }
         if (err.isNotEmpty()) Text(err, color = Bad)
         if (notice.isNotEmpty()) Text(notice, color = Mute)
         AmberButton(
@@ -328,23 +319,19 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
                 busy -> "Working…"
                 mode == "signin" -> "Open vault"
                 mode == "reset" -> "Update password"
-                seed == null -> "Show recovery code"
                 else -> "Create account"
             },
         ) {
             if (busy) return@AmberButton
             err = ""
             notice = ""
-            if (mode == "create" && seed == null) {
+            if (mode == "create") {
                 if (password.length < 8) { err = "Password should be 8 characters or more."; return@AmberButton }
                 if (password != again) { err = "Passwords do not match."; return@AmberButton }
                 if (pin.length < 4) { err = "PIN should be 4 characters or more."; return@AmberButton }
                 if (name.isBlank()) { err = "Add a display name."; return@AmberButton }
                 if (email.isBlank()) { err = "Enter an email."; return@AmberButton }
-                seed = Crypto.freshRecoverySeed()
-                return@AmberButton
             }
-            if (mode == "create" && !kept) { err = "Confirm that you have kept the recovery code."; return@AmberButton }
             if (mode == "signin" && pin.length < 4) { err = "PIN should be 4 characters or more."; return@AmberButton }
             busy = true
             session.relayBase(url)
@@ -354,7 +341,7 @@ fun AccountPane(session: Session, errIn: String, onOpen: (String) -> Unit) {
                         when (mode) {
                             "reset" -> session.completeReset(resetToken, password)
                             "signin" -> session.signIn(email, password, recovery)
-                            else -> session.signUp(email, password, name, seed!!)
+                            else -> session.signUp(email, password, name, Crypto.freshRecoverySeed())
                         }
                     }
                     if (mode == "reset") {
@@ -548,6 +535,7 @@ fun MePane(session: Session, bump: () -> Unit, onPin: (String) -> Unit, onErased
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(session.id.displayName, color = TextC, fontSize = 22.sp)
+        RecoveryCodePane(session)
         JpegFace(session.avatarB64, 96)
         Text("This photo is sealed to people you accepted. There is no public photo.", color = Mute, fontSize = 12.sp)
         TextButton(onClick = { photo.launch("image/*") }) { Text("Choose profile photo", color = Amber) }
@@ -1323,7 +1311,7 @@ fun ThreadPane(
         }
         LazyColumn(Modifier.weight(1f), reverseLayout = true) {
             items(msgs.reversed()) { m ->
-                val bg = if (m.fromMe) Color(0xFF2A2418) else Paper
+                val bg = if (m.fromMe) Color(0xFF203D60) else Paper
                 val hidden = m.viewOnce && !m.fromMe && !m.viewed && !m.deleted
                 Column(
                     Modifier.padding(6.dp).background(bg, RoundedCornerShape(12.dp)).padding(10.dp)
@@ -1641,7 +1629,7 @@ fun GuardianReport(session: Session, bump: () -> Unit, onMe: () -> Unit, onChats
                 if (!devicesLoaded && !deviceErr) Text("Loading device rows.", color = Mute, fontSize = 12.sp)
                 if (devicesLoaded && rows.length() == 0 && !deviceErr) Text("No device rows loaded.", color = Mute, fontSize = 12.sp)
                 if (deviceErr) Text("Device list did not load.", color = Bad)
-                Text("The recovery code was shown once at signup. It is not on this page. It is not on the relay.", color = Mute, fontSize = 12.sp)
+                Text("To see your recovery code, open Account recovery in You.", color = Mute, fontSize = 12.sp)
             }
             3 -> {
                 counts.forEach { (label, n) -> Text("$n  $label", color = TextC) }
@@ -1940,6 +1928,54 @@ fun lockLabel(sec: Int): String = when (sec) {
     900 -> "15 minutes"
     3600 -> "1 hour"
     else -> "$sec seconds"
+}
+
+@Composable
+private fun RecoveryCodePane(session: Session) {
+    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as BleepApp
+    val life = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+    var pin by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    var attempt by remember { mutableStateOf(0) }
+    DisposableEffect(life) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE) {
+                attempt++
+                pin = ""
+                code = ""
+            }
+        }
+        life.lifecycle.addObserver(observer)
+        onDispose { life.lifecycle.removeObserver(observer) }
+    }
+    Text("Account recovery", color = TextC, fontSize = 18.sp)
+    if (session.recoverySeed.isNullOrBlank()) {
+        Text("Use an enrolled device that holds your recovery code.", color = Mute)
+        return
+    }
+    Field("Vault PIN", pin, password = true) { pin = it }
+    TextButton(enabled = pin.isNotEmpty(), onClick = {
+        val enteredPin = pin
+        val request = ++attempt
+        pin = ""
+        code = ""
+        error = ""
+        scope.launch {
+            val verified = withContext(Dispatchers.IO) {
+                runCatching { app.vault.load(enteredPin) }.isSuccess
+            }
+            if (request != attempt) return@launch
+            if (!verified) error = "Could not verify your vault PIN."
+            else session.recoverySeed?.let { code = Crypto.formatRecovery(Bytes.b64d(it)) }
+        }
+    }) { Text("Show recovery code", color = Amber) }
+    if (error.isNotBlank()) Text(error, color = Bad)
+    if (code.isNotBlank()) {
+        Text(code, color = TextC, fontFamily = FontFamily.Monospace)
+        TextButton(onClick = { code = "" }) { Text("Hide recovery code", color = Amber) }
+    }
 }
 
 @Composable

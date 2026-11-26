@@ -184,17 +184,21 @@ class Session(private val relay: Relay) {
     }
 
     fun signIn(email: String, password: String, recovery: String) {
-        val seed = Crypto.parseRecovery(recovery)
         val account = relay.loginAccount(JSONObject(AccountRequests.login(email, password)))
+        check(account.optBoolean("email_confirmed")) { "Confirm your email before opening the vault." }
+        val fresh = account.optBoolean("setup_pending")
+        if (!fresh && account.isNull("mailbox_id")) error("This account has no active mailbox.")
         val mailbox = account.optString("mailbox_id", "")
-        if (mailbox.isBlank()) error("This account has no mailbox yet.")
+        if (!fresh && recovery.isBlank()) error("Enter your recovery code to open this account on a new device.")
+        val seed = if (fresh && recovery.isBlank()) Crypto.freshRecoverySeed() else Crypto.parseRecovery(recovery)
         id = Crypto.identityFromSeed("me", seed)
-        if (id.mailboxId != mailbox) error("Recovery code does not match this account.")
+        if (!fresh && id.mailboxId != mailbox) error("Recovery code does not match this account.")
         recoverySeed = Bytes.b64e(seed)
         accountEmail = email.trim().lowercase()
         freshPrekeys()
+        if (fresh) registerMailbox()
         enrollDevice(account.getString("account_token"))
-        pullHistory()
+        if (!fresh) pullHistory()
     }
 
     private fun freshPrekeys() {

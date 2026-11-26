@@ -299,10 +299,17 @@ def test_confirm_gates_a_second_device(monkeypatch):
             assert blocked.json()["detail"] == "confirm email"
             done = c.post("/v1/accounts/confirm", json={"token": token}, headers=HDR)
             assert done.status_code == 200, done.text
+            credentials = {"email": "erin@example.com", "password": "password1"}
+            pending = c.post("/v1/accounts/login", json=credentials, headers=HDR).json()
+            assert pending["setup_pending"] is True
+            assert pending["mailbox_id"] is None
             again = c.post("/v1/accounts/confirm", json={"token": token}, headers=HDR)
             assert again.status_code == 400
             enrolled = sign_in_device(c, body["account_token"], reg, "phone")
             assert enrolled["device_id"]
+            linked = c.post("/v1/accounts/login", json=credentials, headers=HDR).json()
+            assert linked["setup_pending"] is False
+            assert linked["mailbox_id"] == reg["mailbox_id"]
     finally:
         monkeypatch.setattr(settings, "smtp_host", "")
         monkeypatch.setattr(settings, "smtp_from", "")
